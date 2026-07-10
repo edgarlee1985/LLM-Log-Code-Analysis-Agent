@@ -71,8 +71,15 @@ def gen_faii_index_from_path(repo_path):
     for path in file_paths:
         try:
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-                doc = Document(page_content=content, metadata={"source": path})
+                lines = f.readlines()
+                # 將每一行加上行號，例如： "12 | void doSomething() {"
+                numbered_content = "".join([f"{i+1} | {line}" for i, line in enumerate(lines)])
+                
+                # 用帶有行號的字串去建立 Document
+                doc = Document(page_content=numbered_content, metadata={"source": path})
+
+                #content = f.read()
+                #doc = Document(page_content=content, metadata={"source": path})
                 documents.append(doc)
         except Exception as e:
             print(f"讀取檔案失敗 {path}: {e}")
