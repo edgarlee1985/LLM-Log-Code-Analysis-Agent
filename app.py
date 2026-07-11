@@ -122,7 +122,7 @@ def gen_faii_index_from_path(repo_path):
 
     # 4. 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
-    vector_db = FAISS.from_documents(chunks, embeddings)
+    vector_db = FAISS.from_documents(all_chunks, embeddings)
 
     # 5. 儲存資料庫到本地端
     vector_db.save_local(FAISS_DB_DIR)
