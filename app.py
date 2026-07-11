@@ -12,6 +12,7 @@ import pickle
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_text_splitters import Language
@@ -28,7 +29,7 @@ FAISS_DB_DIR = "./faiss_index"        # 向量資料庫儲存的資料夾名稱
 
 MODEL_NAME = "qwen3"
 
-EMBEDDINGS_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDINGS_MODEL_NAME = "nomic-embed-text"
 
 
 # 定義你想讀取的檔案副檔名
@@ -121,7 +122,7 @@ def gen_faii_index_from_path(repo_path):
     # 3. 初始化嵌入模型 (Embedding Model)
     # 這裡使用 HuggingFace 開源且輕量的模型，適合一般文本與程式碼
     print("正在下載/載入 Embedding 模型...")
-    embeddings = HuggingFaceEmbeddings(model_name = EMBEDDINGS_MODEL_NAME)
+    embeddings = OllamaEmbeddings(model = EMBEDDINGS_MODEL_NAME)
     
     # 4. 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
@@ -147,7 +148,7 @@ def gen_faii_index_from_path(repo_path):
 llm = ChatOllama(model=MODEL_NAME, temperature=0, seed=50) # 也可以替換成 Llama-3.1 或 OpenAI
 
 # 必須使用與建立時相同的 Embedding 模型
-embeddings = HuggingFaceEmbeddings(model_name = EMBEDDINGS_MODEL_NAME)
+embeddings = OllamaEmbeddings(model = EMBEDDINGS_MODEL_NAME)
 
 print(f"檢查 {FAISS_DB_DIR} 是否存在")
 bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
