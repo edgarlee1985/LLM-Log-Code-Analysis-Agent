@@ -13,6 +13,10 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaEmbeddings
+from tree_sitter import Parser, Query, QueryCursor
+from tree_sitter import Language as TSLanguage
+import tree_sitter_python as tspython
+import tree_sitter_cpp as tscpp
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_text_splitters import Language
@@ -53,6 +57,90 @@ EXTENSION_MAPPING = {
 # 定義要忽略的資料夾
 IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
 
+def get_ast_parser_and_query(ext: str):
+    """根據副檔名回傳對應的 Tree-sitter Parser 與 Query 語法"""
+    parser = Parser()
+    query_str = ""
+    ts_language = None # 改用 ts_language 變數名稱
+    
+    if ext in ['.py']:
+        # 使用別名 TSLanguage 進行實例化
+        ts_language = TSLanguage(tspython.language())
+        parser.language = ts_language
+        
+        # 抓取 Python 的 class 與 function
+        query_str = """
+        (class_definition) @class
+        (function_definition) @function
+        """
+    elif ext in ['.cpp', '.h', '.hpp', '.c']:
+        # 使用別名 TSLanguage 進行實例化
+        ts_language = TSLanguage(tscpp.language())
+        parser.language = ts_language
+        
+        # 抓取 C/C++ 的 class、struct 與 function
+        query_str = """
+        (class_specifier) @class
+        (struct_specifier) @struct
+        (function_definition) @function
+        """
+    else:
+        return None, None, None
+        
+    return parser, ts_language, query_str
+
+def ast_chunk_document(doc: Document) -> list[Document]:
+    """將單一檔案原始碼轉化為基於 AST 的多個區塊 (僅支援 tree-sitter >= 0.22.0)"""
+    source_path = doc.metadata.get("source", "")
+    ext = os.path.splitext(source_path)[1].lower()
+    
+    parser, ts_language, query_str = get_ast_parser_and_query(ext)
+    
+    if not parser or not ts_language:
+        return []
+
+    source_bytes = doc.page_content.encode('utf-8')
+    tree = parser.parse(source_bytes)
+    
+    query = Query(ts_language, query_str)
+    cursor = QueryCursor(query)
+    
+    # 新版 captures 直接回傳 dict: { "capture_name": [node1, node2] }
+    raw_captures = cursor.captures(tree.root_node)
+    
+    ast_docs = []
+    normalized_captures = []
+    
+    # 攤平 dict 並重新包裝成 (node, capture_name)
+    for capture_name, nodes in raw_captures.items():
+        for node in nodes:
+            normalized_captures.append((node, capture_name))
+            
+    # 依照 AST 節點在原始碼中的起始位置排序，確保程式碼順序正確
+    normalized_captures.sort(key=lambda x: x[0].start_byte)
+        
+    for node, capture_name in normalized_captures:
+        snippet = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
+        
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        
+        metadata = {
+            "source": source_path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "ast_type": capture_name
+        }
+        
+        numbered_snippet = "\n".join(
+            [f"{start_line + i} | {line}" for i, line in enumerate(snippet.split('\n'))]
+        )
+        
+        ast_docs.append(Document(page_content=numbered_snippet, metadata=metadata))
+        
+    return ast_docs
+
+
 def get_files_from_repo(repo_path):
     """走訪資料夾，取得所有符合條件的檔案路徑"""
     file_paths = []
@@ -75,15 +163,8 @@ def gen_faii_index_from_path(repo_path):
     for path in file_paths:
         try:
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-                # 將每一行加上行號，例如： "12 | void doSomething() {"
-                numbered_content = "".join([f"{i+1} | {line}" for i, line in enumerate(lines)])
-                
-                # 用帶有行號的字串去建立 Document
-                doc = Document(page_content=numbered_content, metadata={"source": path})
-
-                #content = f.read()
-                #doc = Document(page_content=content, metadata={"source": path})
+                content = f.read()
+                doc = Document(page_content=content, metadata={"source": path})
                 documents.append(doc)
         except Exception as e:
             print(f"讀取檔案失敗 {path}: {e}")
@@ -93,29 +174,37 @@ def gen_faii_index_from_path(repo_path):
     # 2. 動態切割文本 (Dynamic Text Splitting)
     all_chunks = []
     
+    # 建立一個通用的 Fallback/二次切塊 Splitter
+    fallback_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500, 
+        chunk_overlap=200
+    )
+    
     for doc in documents:
-        # 從 metadata 取得原始路徑，並萃取副檔名並轉小寫
-        source_path = doc.metadata.get("source", "")
-        ext = os.path.splitext(source_path)[1].lower()
+        # 1. 嘗試使用 AST 切塊
+        ast_chunks = ast_chunk_document(doc)
         
-        # 判斷是否有對應的專屬語言 Splitter
-        if ext in EXTENSION_MAPPING:
-            lang = EXTENSION_MAPPING[ext]
-            splitter = RecursiveCharacterTextSplitter.from_language(
-                language=lang,
-                chunk_size=1000,
-                chunk_overlap=200
-            )
+        if ast_chunks:
+            # 2. 檢查 AST 切出來的區塊是否過大，若過大則進行二次切割
+            for ast_chunk in ast_chunks:
+                if len(ast_chunk.page_content) > 1500:
+                    sub_chunks = fallback_splitter.split_documents([ast_chunk])
+                    all_chunks.extend(sub_chunks)
+                else:
+                    all_chunks.append(ast_chunk)
         else:
-            # 找不到對應語言，退回使用通用字元切塊
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200
-            )
+            # 如果是前端檔案 (如 .html, .css) 或未支援 AST 的語言，退回你原本的邏輯
+            source_path = doc.metadata.get("source", "")
+            ext = os.path.splitext(source_path)[1].lower()
             
-        # 對這個單一檔案進行切塊，並加入總清單中
-        chunks = splitter.split_documents([doc])
-        all_chunks.extend(chunks)
+            if ext in EXTENSION_MAPPING:
+                lang = EXTENSION_MAPPING[ext]
+                lang_splitter = RecursiveCharacterTextSplitter.from_language(
+                    language=lang, chunk_size=1000, chunk_overlap=200
+                )
+                all_chunks.extend(lang_splitter.split_documents([doc]))
+            else:
+                all_chunks.extend(fallback_splitter.split_documents([doc]))
 
     print(f"所有檔案已切割成 {len(all_chunks)} 個區塊 (Chunks)。")
     
@@ -278,7 +367,9 @@ def semantic_code_search(query: str) -> str:
     for d in docs:
         source = d.metadata.get('source', 'Unknown')
         content = d.page_content
-        result.append(f"【檔案: {source}】\n片段內容:\n{content}\n")
+        start = d.metadata.get('start_line', 'Unknown')
+        end = d.metadata.get('end_line', 'Unknown')
+        result.append(f"【檔案: {source} (行號 {start}-{end})】\n片段內容:\n{content}\n")
     return "\n\n---\n\n".join(result)
 
 @tool
