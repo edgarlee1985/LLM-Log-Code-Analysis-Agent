@@ -329,8 +329,39 @@ def get_git_blame(file_name: str, line_number: int) -> str:
             return f"Git Blame 失敗: 檔案沒有第 {line_number} 行，請重新確認該檔案的總行數。"
         return f"Git Blame 失敗: {e.output}"
 
+@tool
+def exact_keyword_search(keyword: str, file_extension: str = "") -> str:
+    """
+    當已知明確的變數名稱、函數名稱或錯誤訊息關鍵字時使用。
+    進行整個 Codebase 的精確字串比對（類似 grep）。
+    可以選擇性提供副檔名過濾 (例如: '.cpp' 或 '.py')。
+    """
+    print(f"exact_keyword_search, keyword = {keyword}, file_extension = {file_extension}")
 
-tools = [semantic_code_search, read_code_snippet, get_git_blame]
+    try:
+        # 使用 git grep 是最快搜尋 repo 的方式 (假設 REPO_PATH 是一個 git repo)
+        cmd = ["git", "grep", "-n", keyword]
+        if file_extension:
+            cmd.append(f"*{file_extension}")
+            
+        result = subprocess.check_output(
+            cmd, 
+            cwd=REPO_PATH, 
+            text=True, 
+            encoding='utf-8',    # 👈 強制要求以 UTF-8 解碼
+            errors='replace',    # 👈 遇到無法解碼的亂碼時，替換成  而非崩潰
+            stderr=subprocess.STDOUT
+        )
+        
+        # 限制回傳長度避免 Context Window 爆掉
+        lines = result.split('\n')
+        if len(lines) > 50:
+            return "\n".join(lines[:50]) + f"\n... (還有 {len(lines) - 50} 筆結果，請提供更精確的關鍵字)"
+        return result
+    except subprocess.CalledProcessError:
+        return f"找不到包含精確關鍵字 '{keyword}' 的程式碼。"
+
+tools = [semantic_code_search, read_code_snippet, get_git_blame, exact_keyword_search]
 
 
 # ==========================================
