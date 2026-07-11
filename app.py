@@ -8,6 +8,9 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langchain_community.vectorstores import FAISS
+import pickle
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -119,7 +122,7 @@ def gen_faii_index_from_path(repo_path):
     # 這裡使用 HuggingFace 開源且輕量的模型，適合一般文本與程式碼
     print("正在下載/載入 Embedding 模型...")
     embeddings = HuggingFaceEmbeddings(model_name = EMBEDDINGS_MODEL_NAME)
-
+    
     # 4. 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
     vector_db = FAISS.from_documents(all_chunks, embeddings)
@@ -127,6 +130,16 @@ def gen_faii_index_from_path(repo_path):
     # 5. 儲存資料庫到本地端
     vector_db.save_local(FAISS_DB_DIR)
     print(f"完成！向量資料庫已儲存至: {FAISS_DB_DIR}")
+
+    # ================= 新增區塊：建立並儲存 BM25 =================
+    print("正在建立 BM25 關鍵字檢索器...")
+    bm25_retriever = BM25Retriever.from_documents(all_chunks)
+    bm25_retriever.k = 3
+    
+    bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
+    with open(bm25_path, "wb") as f:
+        pickle.dump(bm25_retriever, f)
+    print(f"完成！BM25 檢索器已儲存至: {bm25_path}")
 
 # ==========================================
 # 基礎設定 (使用本機 Ollama 舉例)
@@ -137,12 +150,28 @@ llm = ChatOllama(model=MODEL_NAME, temperature=0, seed=50) # 也可以替換成 
 embeddings = HuggingFaceEmbeddings(model_name = EMBEDDINGS_MODEL_NAME)
 
 print(f"檢查 {FAISS_DB_DIR} 是否存在")
-if not os.path.isdir(FAISS_DB_DIR):
+bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
+faiss_index_path = os.path.join(FAISS_DB_DIR, "index.faiss")
+if not (os.path.isdir(FAISS_DB_DIR) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
     gen_faii_index_from_path(REPO_PATH)
 
 # 載入本地端的 FAISS 資料庫
 # allow_dangerous_deserialization=True 是因為 FAISS 使用 pickle，載入信任的本地檔案時需開啟此設定
 vector_db = FAISS.load_local(FAISS_DB_DIR, embeddings, allow_dangerous_deserialization=True)
+
+# 將 FAISS 轉為標準 Retriever
+faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+
+# ================= 新增區塊：載入 BM25 並組合 =================
+bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
+with open(bm25_path, "rb") as f:
+    bm25_retriever = pickle.load(f)
+
+# 建立混合檢索器 (權重可依據測試結果微調，這裡先設定各 50%)
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[bm25_retriever, faiss_retriever],
+    weights=[0.5, 0.5]
+)
 
 
 class SingleBugReport(BaseModel):
@@ -243,7 +272,7 @@ def parse_report(bug_report: SingleBugReport) -> LogClues:
 @tool
 def semantic_code_search(query: str) -> str:
     """當不知道具體檔名，但知道邏輯異常時使用。根據語意搜尋 Codebase。"""
-    docs = vector_db.similarity_search(query, k=3)
+    docs = ensemble_retriever.invoke(query)
     result = []
     for d in docs:
         source = d.metadata.get('source', 'Unknown')
