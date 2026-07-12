@@ -401,25 +401,39 @@ def get_git_blame(file_name: str, line_number: int) -> str:
     
     print(f"get_git_blame, file_name = {file_name}, line_number = {line_number}")
 
-    # 1. 取得檔案所在的目錄
+    # 🛑 1. 防呆檢查：確保檔案與目錄真的存在
+    if not os.path.exists(file_name):
+        return f"Git Blame 失敗: 找不到檔案 '{file_name}'。"
+
+    # 2. 取得檔案所在的目錄
     work_dir = os.path.dirname(file_name)
     
-    # 2. 取得純檔名 (例如：main.cpp)
+    # 🛑 再次確認目錄是否為有效目錄 (避免預期外的檔案系統問題)
+    if not os.path.isdir(work_dir):
+        return f"Git Blame 失敗: 目錄 '{work_dir}' 無效。"
+    
+    # 3. 取得純檔名 (例如：main.cpp)
     base_name = os.path.basename(file_name)
     
-    # 3. 透過 cwd 參數指定在該檔案的目錄下執行指令
+    # 4. 透過 cwd 參數指定在該檔案的目錄下執行指令
     try:
         return subprocess.check_output(
             ["git", "blame", "-L", f"{line_number},{line_number}", base_name],
             cwd=work_dir,
             text=True,
-            stderr=subprocess.STDOUT # ✅ 將 Git 的錯誤訊息合併到輸出中捕獲
+            encoding='utf-8',    # 👉 強制要求以 UTF-8 解碼 Git 的輸出
+            errors='replace',    # 👉 遇到無法解碼的亂碼時，替換成  而非崩潰
+            stderr=subprocess.STDOUT
         )
+    
     except subprocess.CalledProcessError as e:
         # 如果 LLM 傳了超過檔案行數的數字，明確告訴它錯在哪裡
         if "has only" in e.output:
             return f"Git Blame 失敗: 檔案沒有第 {line_number} 行，請重新確認該檔案的總行數。"
         return f"Git Blame 失敗: {e.output}"
+    except Exception as e:
+        # 🛑 捕捉所有其他可能的錯誤，確保 Agent 不會崩潰
+        return f"執行 Git Blame 時發生未知的系統錯誤: {str(e)}"
 
 @tool
 def exact_keyword_search(keyword: str, file_extension: str = "") -> str:
