@@ -1,13 +1,18 @@
 import os
 import configparser
 from typing import List, Dict, Optional
+from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field
 from pathlib import Path
+
+import operator
 
 # 現代 LangChain 工具與 LCEL
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
+from langgraph.graph import StateGraph, END
+
 from langchain_community.vectorstores import FAISS
 import pickle
 from langchain_classic.retrievers import EnsembleRetriever
@@ -24,7 +29,6 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_text_splitters import Language
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.callbacks import StreamingStdOutCallbackHandler
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -471,6 +475,208 @@ tools = [semantic_code_search, read_code_snippet, get_git_blame, exact_keyword_s
 # ==========================================
 # 步驟三：導入 Agentic 迭代排查（Agentic Workflow）
 # ==========================================
+
+# ==========================================
+# 結構化資料模型 (Pydantic Models)
+# ==========================================
+class DetectiveCommand(BaseModel):
+    """工程師開給探員的情報需求單"""
+    hypothesis: str = Field(description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
+    action_type: str = Field(description="要執行的檢索類型：READ_FILE, SEMANTIC_SEARCH, EXACT_KEYWORD 等")
+    target_value: str = Field(description="對應的關鍵字、檔案路徑或語意描述")
+    focus_point: str = Field(description="請探員特別注意什麼？例如：'請幫我確認這個 class 有沒有繼承 BaseUser'")
+
+class EngineerEvaluation(BaseModel):
+    """工程師的深度分析與決策報告"""
+    step_by_step_reasoning: str = Field(description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
+    is_resolved: bool = Field(description="是否已經找到 Root Cause 並能提出修復方案？")
+    next_search_request: Optional[DetectiveCommand] = Field(default=None, description="如果尚未解決，指派給探員的下一步檢索指令")
+    final_report: Optional[str] = Field(default="", description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
+
+# ==========================================
+# 全局狀態 (GraphState)
+# ==========================================
+
+class GraphState(TypedDict):
+    bug_id: str
+    steps: str
+    logs: str
+    log_clues: str
+    
+    # 使用 operator.add 讓每次的調查紀錄自動附加，形成對話歷史
+    investigation_history: Annotated[List[str], operator.add] 
+    
+    # 存放 Engineer 開出的具體指令 (DetectiveCommand 的 dict 格式)
+    current_request: Optional[dict] 
+    
+    iterations: int
+    is_resolved: bool
+    final_report: str
+
+# ==========================================
+# 3. Prompts (工程師的 System & Human Prompt)
+# ==========================================
+
+engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責帶領團隊進行複雜系統的除錯 (Debugging)。
+你的唯一目標是找出系統 Bug 的根本原因 (Root Cause) 並提出精確的修復方案。
+
+你目前正在與一位「檢索探員 (Detective)」合作。探員負責深入 Codebase 撈取程式碼，而你負責指揮他。
+
+【💡 工作模式：假設驅動 (Hypothesis-Driven)】
+你必須嚴格遵循以下思考循環：
+1. 觀察 (Observe)：仔細閱讀使用者的 Bug 重現步驟與原始系統 Log。
+2. 回顧 (Review)：檢視你與探員的「歷史調查紀錄」。特別留意【執行失敗 / 查無資料】的回報，這代表你先前的假設路徑或關鍵字錯誤，你必須改變策略，絕對不要重複發送相同的無效指令。
+3. 推理 (Reasoning)：將 Log 線索與探員帶回的程式碼進行交叉比對，找出邏輯斷層。
+4. 假設 (Hypothesis)：針對可能出錯的邏輯提出具體假設（例如："我懷疑 `calculate_total` 沒有處理空陣列"）。
+5. 行動 (Action)：如果你確信已找到 Root Cause，宣告結案並撰寫報告；若證據不足，開立精確的情報需求單給探員。
+
+【🚨 核心守則】
+1. 絕不憑空捏造：絕對不要幻想或猜測未被檢索出來的程式碼邏輯。如果你沒親眼看到那段程式碼，就請探員去讀取。
+2. 保持專注：只針對導致「當前 Bug Log」的程式碼進行排查，不要發散去檢查無關的模組或提出無謂的重構建議。
+3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，不要瞎猜路徑，請指示探員使用語意搜尋 (SEMANTIC_SEARCH) 來尋找相關邏輯。
+
+【📝 輸出要求】
+你必須嚴格遵守 JSON 格式輸出，並將詳盡的思考過程寫在 `step_by_step_reasoning` 中。
+"""
+
+engineer_human_prompt = """
+【Bug 重現步驟】
+{steps}
+
+【系統 Log 原始紀錄】
+{logs}
+
+【歷史調查紀錄 (Investigation History)】
+{investigation_history}
+
+====================================
+請基於以上資訊，進行深度思考並給出你的評估：
+1. 如果你需要更多線索，請填寫 next_search_request 派發任務給探員。
+2. 如果你已經確定根本原因，請將 is_resolved 設為 true，並給出 final_report。
+"""
+
+
+# ==========================================
+# 4. 核心節點 (Nodes)
+# ==========================================
+
+def engineer_node(state: GraphState):
+    print(f"\n[Engineer Node] 開始深度分析 (第 {state['iterations']} 次迭代)...")
+    
+    # 將歷史紀錄從 List[str] 組裝成單一字串，讓 LLM 閱讀
+    if not state.get("investigation_history"):
+        history_text = "目前尚無調查紀錄，這是第一次推論。請根據 Log 提出第一個假設並指派探員去檢索。"
+    else:
+        history_text = "\n\n".join(state["investigation_history"])
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", engineer_system_prompt),
+        ("human", engineer_human_prompt)
+    ])
+    
+    # 呼叫 LLM 並強制輸出結構化資料
+    analysis_chain = prompt | llm.with_structured_output(EngineerEvaluation)
+    evaluation = analysis_chain.invoke({
+        "steps": state["steps"],
+        "logs": state["logs"],
+        "investigation_history": history_text
+    })
+    
+    print(f"狀態評估: is_resolved={evaluation.is_resolved}")
+    if not evaluation.is_resolved:
+        print(f"下一步假設: {evaluation.next_search_request.hypothesis if evaluation.next_search_request else '無'}")
+        print(f"下一步行動: {evaluation.next_search_request.action_type if evaluation.next_search_request else '無'}")
+        
+    return {
+        # 將 Pydantic 物件轉成 dict 存入 state (相容性較好)
+        "current_request": evaluation.next_search_request.model_dump() if evaluation.next_search_request else None,
+        "is_resolved": evaluation.is_resolved,
+        "final_report": evaluation.final_report or ""
+    }
+
+
+def detective_node(state: GraphState):
+    print(f"\n[Detective Node] 啟動 (第 {state['iterations']} 次迭代)")
+    
+    # 從 Engineer 的需求單中提取資訊，如果沒有就使用最初的 log clues
+    if state.get("current_request"):
+        req = state["current_request"]
+        search_query = (
+            f"【目標】: {req.get('target_value')}\n"
+            f"【任務類型】: {req.get('action_type')}\n"
+            f"【工程師的假設】: {req.get('hypothesis')}\n"
+            f"【關注點】: {req.get('focus_point')}"
+        )
+    else:
+        search_query = f"請根據以下 Log 線索自由檢索：{state['log_clues']}"
+    
+    # 給探員的專屬 Prompt (補齊了 steps 和 logs，讓它有全局 Context)
+    detective_prompt = ChatPromptTemplate.from_messages([
+        ("system", """你是一個精準的程式碼檢索探員。
+        你的任務是根據工程師的需求單，使用適當的工具去尋找程式碼。
+        
+        【嚴格守則】
+        1. 誠實回報：如果工具回報錯誤（例如檔案找不到、路徑錯誤、無搜尋結果），請「原封不動」回傳錯誤訊息給工程師，絕對不要編造程式碼或隱瞞錯誤！
+        2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。"""),
+        ("human", "【情報需求單】\n{query}\n\n【原始 Bug 步驟】\n{steps}\n\n【原始 Log】\n{logs}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+    
+    # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
+    agent = create_tool_calling_agent(llm, tools, detective_prompt)
+    agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
+    
+    # 執行檢索
+    result = agent_runner.invoke({
+        "query": search_query,
+        "steps": state["steps"],
+        "logs": state["logs"]
+    })
+    
+    # 建立這次調查的結構化報告字串，並打包進陣列
+    new_report = (
+        f"=== 第 {state['iterations']} 次調查 ===\n"
+        f"📥 收到指令:\n{search_query}\n"
+        f"📤 調查結果:\n{result['output']}\n"
+    )
+    
+    return {
+        "investigation_history": [new_report], # 使用 operator.add 會自動把這個陣列接在舊紀錄後面
+        "iterations": state["iterations"] + 1
+    }
+
+# --- 路由判斷邏輯 ---
+def should_continue(state: GraphState):
+    # 如果已經解決，或者迭代次數超過上限 (例如 5 次)，就走向終點
+    if state.get("is_resolved", False) or state["iterations"] >= 5:
+        return "end"
+    # 否則，退回給 Detective 繼續找資料
+    return "continue"
+
+# --- 組合與編譯 LangGraph ---
+def build_debugging_graph():
+    workflow = StateGraph(GraphState)
+    
+    # 1. 註冊 Nodes
+    workflow.add_node("detective", detective_node)
+    workflow.add_node("engineer", engineer_node)
+    
+    # 2. 定義流程順序 (Edges)
+    workflow.set_entry_point("detective") # 入口點
+    workflow.add_edge("detective", "engineer") # Detective 找完資料，必定交給 Engineer
+    
+    # 3. 條件路由 (Conditional Edge)
+    workflow.add_conditional_edges(
+        "engineer",
+        should_continue,
+        {
+            "continue": "detective", # 如果還沒解決，走回 detective
+            "end": END                 # 如果解決了，走向 END
+        }
+    )
+    
+    return workflow.compile()
+
 def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
     """建立並執行負責除錯的 AgentRunner"""
     
@@ -534,6 +740,9 @@ def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
 # ==========================================
 if __name__ == "__main__":
     bug_reports = read_bug_report(config["Default"]["BugReportDir"])
+    
+    # 建立 Graph
+    debugger_app = build_debugging_graph()
 
     for report in bug_reports:
         print(f"開始分析 bug_id: {report.bug_id}")
@@ -541,7 +750,29 @@ if __name__ == "__main__":
         clues = parse_report(report)
         print(f"萃取線索: {clues}\n")
         
-        print("--- 階段二 & 三：啟動 Agentic 迭代排查 ---")
-        final_report = run_debugging_agent(report, clues)
-        print("\n--- 最終 Bug 報告 ---")
-        print(final_report)
+        # 初始化 State
+        initial_state = {
+            "bug_id": report.bug_id,
+            "steps": report.steps_to_reproduce,
+            "logs": "\n".join([f"=== {k} ===\n{v}" for k, v in report.logs.items()]),
+            "log_clues": clues.model_dump_json(),
+            
+            # 變數更名
+            "investigation_history": [],
+            "current_request": None, 
+            
+            "iterations": 1,
+            "is_resolved": False,
+            "final_report": ""
+        }
+        
+        # 執行 Graph 迴圈
+        # .invoke 會一直跑到抵達 END 節點才會回傳最終的 State
+        final_state = debugger_app.invoke(initial_state)
+        print("\n🏆 --- 最終 Bug 報告 --- 🏆")
+        print(final_state.get("final_report", "無法在迭代次數內找到完整的 Root Cause。以下是目前分析：\n" + final_state.get("missing_information", "")))
+
+        #print("--- 階段二 & 三：啟動 Agentic 迭代排查 ---")
+        #final_report = run_debugging_agent(report, clues)
+        #print("\n--- 最終 Bug 報告 ---")
+        #print(final_report)
