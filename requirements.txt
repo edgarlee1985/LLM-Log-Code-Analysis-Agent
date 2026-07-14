@@ -8,3 +8,6 @@ langchain_google_genai
 sentence-transformers
 faiss-cpu
 rank_bm25
+tree_sitter
+tree_sitter_python
+tree_sitter_cpp

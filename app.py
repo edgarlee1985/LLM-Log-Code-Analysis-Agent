@@ -1,4 +1,5 @@
 import os
+import configparser
 from typing import List, Dict, Optional
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -13,10 +14,12 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import OllamaEmbeddings
+
 from tree_sitter import Parser, Query, QueryCursor
 from tree_sitter import Language as TSLanguage
 import tree_sitter_python as tspython
 import tree_sitter_cpp as tscpp
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_text_splitters import Language
@@ -26,15 +29,6 @@ from langchain_core.callbacks import StreamingStdOutCallbackHandler
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 import subprocess
-
-BUG_REPORT_DIR = "Report Folder" # Bug Report 路徑
-REPO_PATH = "Git Folder"  # Git repo 路徑
-FAISS_DB_DIR = "./faiss_index"        # 向量資料庫儲存的資料夾名稱
-
-MODEL_NAME = "qwen3"
-
-EMBEDDINGS_MODEL_NAME = "nomic-embed-text"
-
 
 # 定義你想讀取的檔案副檔名
 ALLOWED_EXTENSIONS = {'.h', '.cpp', '.ts', '.ui', '.css', '.txt', '.json'}
@@ -56,6 +50,10 @@ EXTENSION_MAPPING = {
 }
 # 定義要忽略的資料夾
 IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
+
+# 創建 configparser 物件
+config = configparser.ConfigParser()
+config.read('config.ini', encoding='utf-8')
 
 def get_ast_parser_and_query(ext: str):
     """根據副檔名回傳對應的 Tree-sitter Parser 與 Query 語法"""
@@ -211,22 +209,22 @@ def gen_faii_index_from_path(repo_path):
     # 3. 初始化嵌入模型 (Embedding Model)
     # 這裡使用 HuggingFace 開源且輕量的模型，適合一般文本與程式碼
     print("正在下載/載入 Embedding 模型...")
-    embeddings = OllamaEmbeddings(model = EMBEDDINGS_MODEL_NAME)
+    embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
     
     # 4. 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
     vector_db = FAISS.from_documents(all_chunks, embeddings)
 
     # 5. 儲存資料庫到本地端
-    vector_db.save_local(FAISS_DB_DIR)
-    print(f"完成！向量資料庫已儲存至: {FAISS_DB_DIR}")
+    vector_db.save_local(config["Default"]["FAISSDBDir"])
+    print(f"完成！向量資料庫已儲存至: {config["Default"]["FAISSDBDir"]}")
 
     # ================= 新增區塊：建立並儲存 BM25 =================
     print("正在建立 BM25 關鍵字檢索器...")
     bm25_retriever = BM25Retriever.from_documents(all_chunks)
     bm25_retriever.k = 3
     
-    bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
+    bm25_path = os.path.join(config["Default"]["FAISSDBDir"], "bm25_retriever.pkl")
     with open(bm25_path, "wb") as f:
         pickle.dump(bm25_retriever, f)
     print(f"完成！BM25 檢索器已儲存至: {bm25_path}")
@@ -234,26 +232,26 @@ def gen_faii_index_from_path(repo_path):
 # ==========================================
 # 基礎設定 (使用本機 Ollama 舉例)
 # ==========================================
-llm = ChatOllama(model=MODEL_NAME, temperature=0, seed=50) # 也可以替換成 Llama-3.1 或 OpenAI
+llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0, seed=50) # 也可以替換成 Llama-3.1 或 OpenAI
 
 # 必須使用與建立時相同的 Embedding 模型
-embeddings = OllamaEmbeddings(model = EMBEDDINGS_MODEL_NAME)
+embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
 
-print(f"檢查 {FAISS_DB_DIR} 是否存在")
-bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
-faiss_index_path = os.path.join(FAISS_DB_DIR, "index.faiss")
-if not (os.path.isdir(FAISS_DB_DIR) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
-    gen_faii_index_from_path(REPO_PATH)
+print(f"檢查 {config["Default"]["FAISSDBDir"]} 是否存在")
+bm25_path = os.path.join(config["Default"]["FAISSDBDir"], "bm25_retriever.pkl")
+faiss_index_path = os.path.join(config["Default"]["FAISSDBDir"], "index.faiss")
+if not (os.path.isdir(config["Default"]["FAISSDBDir"]) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
+    gen_faii_index_from_path(config["Default"]["RepoDir"])
 
 # 載入本地端的 FAISS 資料庫
 # allow_dangerous_deserialization=True 是因為 FAISS 使用 pickle，載入信任的本地檔案時需開啟此設定
-vector_db = FAISS.load_local(FAISS_DB_DIR, embeddings, allow_dangerous_deserialization=True)
+vector_db = FAISS.load_local(config["Default"]["FAISSDBDir"], embeddings, allow_dangerous_deserialization=True)
 
 # 將 FAISS 轉為標準 Retriever
 faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
 
 # ================= 新增區塊：載入 BM25 並組合 =================
-bm25_path = os.path.join(FAISS_DB_DIR, "bm25_retriever.pkl")
+bm25_path = os.path.join(config["Default"]["FAISSDBDir"], "bm25_retriever.pkl")
 with open(bm25_path, "rb") as f:
     bm25_retriever = pickle.load(f)
 
@@ -445,14 +443,14 @@ def exact_keyword_search(keyword: str, file_extension: str = "") -> str:
     print(f"exact_keyword_search, keyword = {keyword}, file_extension = {file_extension}")
 
     try:
-        # 使用 git grep 是最快搜尋 repo 的方式 (假設 REPO_PATH 是一個 git repo)
+        # 使用 git grep 是最快搜尋 repo 的方式 (假設 repo path 是一個 git repo)
         cmd = ["git", "grep", "-n", keyword]
         if file_extension:
             cmd.append(f"*{file_extension}")
             
         result = subprocess.check_output(
             cmd, 
-            cwd=REPO_PATH, 
+            cwd=config["Default"]["RepoDir"], 
             text=True, 
             encoding='utf-8',    # 👈 強制要求以 UTF-8 解碼
             errors='replace',    # 👈 遇到無法解碼的亂碼時，替換成  而非崩潰
@@ -535,7 +533,7 @@ def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
 # 主程式：完整工作流整合
 # ==========================================
 if __name__ == "__main__":
-    bug_reports = read_bug_report(BUG_REPORT_DIR)
+    bug_reports = read_bug_report(config["Default"]["BugReportDir"])
 
     for report in bug_reports:
         print(f"開始分析 bug_id: {report.bug_id}")
