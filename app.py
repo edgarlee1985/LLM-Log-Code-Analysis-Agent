@@ -326,7 +326,9 @@ def read_bug_report(report_dir: str) -> List[SingleBugReport]:
 # 1. 定義預期的 Log 結構
 class LogClues(BaseModel):
     error_type: Optional[str] = Field(description="明確的錯誤類型，如 TypeError，若無則留空")
-    file_name: Optional[str] = Field(description="Log 中提到的可能發生錯誤的檔案名稱")
+    file_name: Optional[str] = Field(
+        description="Log 中提到的錯誤檔案路徑（請直接擷取 Log 中顯示的路徑，例如 /path/code/.../main.cpp 或 src/main.cpp，能抓多完整就抓多完整）"
+    )
     line_number: Optional[int] = Field(description="錯誤發生的行號，若無則為 -1", default=-1)
     semantic_issue: str = Field(description="將 Log 的行為總結為一句語意描述，例如：'事件迴圈重複觸發'")
 
@@ -374,48 +376,99 @@ def semantic_code_search(query: str) -> str:
         result.append(f"【檔案: {source} (行號 {start}-{end})】\n片段內容:\n{content}\n")
     return "\n\n---\n\n".join(result)
 
-@tool
-def read_code_snippet(file_name: str, start_line: int, end_line: int) -> str:
-    """
-    當已知確切檔案名稱與行號時，讀取該檔案特定範圍的程式碼。
-    注意：file_name 必須是絕對路徑，不可以只有純檔名。
-    """
-    print(f"read_code_snippet, file_name = {file_name}, start_line = {start_line}, end_line = {end_line}")
+def resolve_best_repo_path(log_path_hint: str, repo_dir: str) -> str:
+    """根據 Log 提供的路徑，利用最長共同目錄比對 (Longest Common Suffix) 找出真實的 Repo 路徑"""
+    if not log_path_hint:
+        return ""
+        
+    # 將 Log 路徑統一為 POSIX 格式以便切割
+    log_parts = Path(log_path_hint.replace("\\", "/")).parts
+    target_filename = log_parts[-1] # 取得最右邊的純檔名
+    
+    candidates = []
+    # 掃描 Repo 找出所有「檔名完全相同」的檔案
+    for root, dirs, files in os.walk(repo_dir):
+        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS] # 濾除不需要掃描的資料夾
+        if target_filename in files:
+            candidates.append(os.path.join(root, target_filename))
+            
+    if not candidates:
+        return ""
+        
+    # 如果只有一個，就直接回傳，省下比對時間
+    if len(candidates) == 1:
+        return candidates[0]
+        
+    # 如果有多個同名檔案，進行從右到左的資料夾比對
+    best_match = ""
+    max_score = -1
+    
+    for cand_path in candidates:
+        cand_parts = Path(cand_path).parts
+        
+        # 從右往左 (reversed) 逐層比對：檔名 -> 父資料夾 -> 祖父資料夾...
+        score = 0
+        for log_p, cand_p in zip(reversed(log_parts), reversed(cand_parts)):
+            if log_p.lower() == cand_p.lower():
+                score += 1
+            else:
+                break # 一旦遇到不同的資料夾名稱就停止計分
+                
+        if score > max_score:
+            max_score = score
+            best_match = cand_path
+            
+    return best_match
 
-    # 防呆檢查：如果檔案不存在，給 LLM 一個有建設性的錯誤提示
-    if not os.path.exists(file_name):
-        return (f"讀取檔案失敗: 找不到檔案 '{file_name}'。 請提供完整的檔案路徑後重試。")
+@tool
+def read_code_snippet(file_path_hint: str, start_line: int, end_line: int) -> str:
+    """
+    當已知檔案名稱與行號時，讀取特定範圍的程式碼。
+    注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
+    """
+    print(f"read_code_snippet, file_path_hint = {file_path_hint}, start_line = {start_line}, end_line = {end_line}")
+
+    repo_dir = config["Default"]["RepoDir"]
+    actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+    
+    if not actual_path:
+        return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
 
     try:
-        # ✅ 明確指定 UTF-8 編碼，並忽略/替換無法解析的字元
-        with open(file_name, 'r', encoding='utf-8', errors='replace') as f:
+        with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()[start_line-1:end_line]
         return "".join(lines)
     except Exception as e:
         return f"讀取檔案失敗: {e}"
 
 @tool
-def get_git_blame(file_name: str, line_number: int) -> str:
+def get_git_blame(file_path_hint: str, line_number: int) -> str:
     """
     查詢某行程式碼的 Git Blame，了解是誰在什麼時候修改了這行邏輯
-    注意：file_name 必須是絕對路徑，不可以只有純檔名。
+    注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
     """
     
-    print(f"get_git_blame, file_name = {file_name}, line_number = {line_number}")
+    print(f"get_git_blame, file_path_hint = {file_path_hint}, line_number = {line_number}")
+    
+    repo_dir = config["Default"]["RepoDir"]
+    actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+    
+    if not actual_path:
+        return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
 
     # 🛑 1. 防呆檢查：確保檔案與目錄真的存在
-    if not os.path.exists(file_name):
-        return f"Git Blame 失敗: 找不到檔案 '{file_name}'。"
+    if not os.path.exists(actual_path):
+        return f"Git Blame 失敗: 找不到檔案 '{actual_path}'。"
 
     # 2. 取得檔案所在的目錄
-    work_dir = os.path.dirname(file_name)
+    work_dir = os.path.dirname(actual_path)
     
     # 🛑 再次確認目錄是否為有效目錄 (避免預期外的檔案系統問題)
     if not os.path.isdir(work_dir):
         return f"Git Blame 失敗: 目錄 '{work_dir}' 無效。"
     
     # 3. 取得純檔名 (例如：main.cpp)
-    base_name = os.path.basename(file_name)
+    base_name = os.path.basename(actual_path)
     
     # 4. 透過 cwd 參數指定在該檔案的目錄下執行指令
     try:
