@@ -236,7 +236,7 @@ def gen_faii_index_from_path(repo_path):
 # ==========================================
 # 基礎設定 (使用本機 Ollama 舉例)
 # ==========================================
-llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0, seed=50) # 也可以替換成 Llama-3.1 或 OpenAI
+llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
 
 # 必須使用與建立時相同的 Embedding 模型
 embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
@@ -265,12 +265,11 @@ ensemble_retriever = EnsembleRetriever(
     weights=[0.5, 0.5]
 )
 
-
 class SingleBugReport(BaseModel):
     """單一 Bug 的資料結構"""
-    bug_id: str # 例如: "bug_000001"
-    steps_to_reproduce: str # bug_xxxxxx.txt 內的文字內容
-    logs: Dict[str, str] # 紀錄該 bug 底下所有的 log，格式為 { "application.log_1": "log內容..." }
+    bug_id: str = Field(default="", description="Bug 的唯一識別碼，例如: 'bug_000001'")
+    steps_to_reproduce: str = Field(default="", description="記錄重現步驟，通常為 bug_xxxxxx.txt 內的文字內容")
+    logs: Dict[str, str] = Field(default_factory=dict, description="紀錄該 bug 底下所有的 log，格式為 { 'application.log_1': 'log內容...' }")
 
 def read_bug_report(report_dir: str) -> List[SingleBugReport]:
     """
@@ -325,12 +324,13 @@ def read_bug_report(report_dir: str) -> List[SingleBugReport]:
 # ==========================================
 # 1. 定義預期的 Log 結構
 class LogClues(BaseModel):
-    error_type: Optional[str] = Field(description="明確的錯誤類型，如 TypeError，若無則留空")
+    error_type: Optional[str] = Field(default=None, description="明確的錯誤類型，如 TypeError，若無則留空")
     file_name: Optional[str] = Field(
+        default=None,
         description="Log 中提到的錯誤檔案路徑（請直接擷取 Log 中顯示的路徑，例如 /path/code/.../main.cpp 或 src/main.cpp，能抓多完整就抓多完整）"
     )
-    line_number: Optional[int] = Field(description="錯誤發生的行號，若無則為 -1", default=-1)
-    semantic_issue: str = Field(description="將 Log 的行為總結為一句語意描述，例如：'事件迴圈重複觸發'")
+    line_number: Optional[int] = Field(default=-1, description="錯誤發生的行號，若無則為 -1")
+    semantic_issue: str = Field(default="", description="將 Log 的行為總結為一句語意描述，例如：'事件迴圈重複觸發'")
 
 def parse_report(bug_report: SingleBugReport) -> LogClues:
     """使用 LLM 將雜亂的 Log 轉換為結構化線索"""
@@ -341,14 +341,39 @@ def parse_report(bug_report: SingleBugReport) -> LogClues:
         f"=== {filename} ===\n{content}" 
         for filename, content in bug_report.logs.items()
     )
+
+    # 將 Windows 路徑的反斜線替換為正斜線，避免 JSON 跳脫字元崩潰
+    combined_logs = combined_logs.replace("\\", "/")
     
     # 如果 logs 是空的，給予預設提示避免 LLM 混淆
     if not combined_logs.strip():
         combined_logs = "此 Bug 沒有任何對應的 Log 紀錄。"
 
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "你是一個 Log 分析系統。請從以下 Log 中萃取出關鍵資訊。如果沒有明確的 Exception，請推敲其語意異常行為。"),
-        ("human", "{raw_log}")
+        ("system", """你是一個專為「AI 檢索探員 (RAG Agent)」提供精確搜索彈藥的【資深技術日誌萃取引擎】。
+你收到的原始資料可能混雜了「QA/RD 的口語對話」、「測試步驟」以及「系統崩潰日誌 (Log/Stack Trace)」。
+
+【你的核心任務】
+如同外科手術般，過濾掉所有人類的日常用語與情緒字眼，只留下能夠用來進行「精確字串搜尋 (grep)」或「程式碼語意檢索」的技術實體 (Technical Entities)。
+
+【資料萃取嚴格守則】
+1. 錯誤類型 (error_type):
+   - 僅抓取標準的 Exception 命名或系統錯誤碼 (例如: NullReferenceException, TypeError, SIGSEGV, HTTP 500)。
+   - 若只是邏輯錯誤 (如: 算錯錢、畫面卡住)，請留空 (null)。
+
+2. 檔案與行號 (file_name & line_number):
+   - 優先從 Stack Trace 或 Error Log 中尋找確實崩潰的檔案路徑。
+   - 盡可能保留最完整的相對/絕對路徑 (如 src/controllers/user_controller.cpp)，不要只留純檔名。
+
+3. 語意描述 (semantic_issue) 撰寫規範 (🚨 極度重要):
+   - 你的輸出將直接作為向量搜尋庫 (FAISS) 的 Query，必須高度技術化。
+   - 強制保留原始文本中的所有英文實體：包含變數名稱 (Variable)、類別 (Class)、函數 (Function / CamelCase / snake_case) 或 API 路由 (/api/v1/login)。
+   - 將人類的「行為描述」轉換為「系統狀態異常描述」。
+   - ❌ 錯誤示範 (太口語)："QA 說按下結帳按鈕後畫面卡住了，RD 覺得可能是 API 沒回傳，叫我看一下 login log。"
+   - ✅ 正確示範 (具檢索價值)："觸發 Checkout 按鈕後發生 timeout，疑似 PaymentGateway 模組中的 fetch_user_token 未正確處理空值回傳。"
+
+請保持冷靜、客觀，忽略無關痛癢的對話，輸出最精煉的技術線索。"""),
+        ("human", "【原始 Bug 報告與 Log 紀錄】\n{raw_log}")
     ])
     
     # 結合 LCEL 與 Structured Output 確保回傳 Pydantic 格式
@@ -534,17 +559,17 @@ tools = [semantic_code_search, read_code_snippet, get_git_blame, exact_keyword_s
 # ==========================================
 class DetectiveCommand(BaseModel):
     """工程師開給探員的情報需求單"""
-    hypothesis: str = Field(description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
-    action_type: str = Field(description="要執行的檢索類型：READ_FILE, SEMANTIC_SEARCH, EXACT_KEYWORD 等")
-    target_value: str = Field(description="對應的關鍵字、檔案路徑或語意描述")
-    focus_point: str = Field(description="請探員特別注意什麼？例如：'請幫我確認這個 class 有沒有繼承 BaseUser'")
+    hypothesis: str = Field(default="", description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
+    action_type: str = Field(default="", description="要執行的檢索類型：READ_FILE, SEMANTIC_SEARCH, EXACT_KEYWORD 等")
+    target_value: str = Field(default="", description="對應的關鍵字、檔案路徑或語意描述")
+    focus_point: str = Field(default="", description="請探員特別注意什麼？例如：'請幫我確認這個 class 有沒有繼承 BaseUser'")
 
 class EngineerEvaluation(BaseModel):
     """工程師的深度分析與決策報告"""
-    step_by_step_reasoning: str = Field(description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
-    is_resolved: bool = Field(description="是否已經找到 Root Cause 並能提出修復方案？")
+    step_by_step_reasoning: str = Field(default="", description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
+    is_resolved: bool = Field(default=False, description="是否已經找到 Root Cause 並能提出修復方案？")
     next_search_request: Optional[DetectiveCommand] = Field(default=None, description="如果尚未解決，指派給探員的下一步檢索指令")
-    final_report: Optional[str] = Field(default="", description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
+    final_report: Optional[str] = Field(default=None, description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
 
 # ==========================================
 # 全局狀態 (GraphState)
@@ -589,7 +614,28 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，不要瞎猜路徑，請指示探員使用語意搜尋 (SEMANTIC_SEARCH) 來尋找相關邏輯。
 
 【📝 輸出要求】
-你必須嚴格遵守 JSON 格式輸出，並將詳盡的思考過程寫在 `step_by_step_reasoning` 中。
+你必須嚴格遵守 JSON 格式輸出。請根據你是否已經找到 Root Cause，選擇以下兩種 JSON 格式之一進行輸出：
+
+情況 A：尚未解決，需要探員繼續檢索
+{{
+    "step_by_step_reasoning": "我剛剛看到...這代表...我接下來需要確認...",
+    "is_resolved": false,
+    "next_search_request": {{
+        "hypothesis": "我懷疑 Button 沒有綁定正確的 index",
+        "action_type": "READ_FILE",
+        "target_value": "/path/code/src/GenTestLogProject.cpp",
+        "focus_point": "檢查 OnButtonClikced 的實作邏輯"
+    }},
+    "final_report": ""
+}}
+
+情況 B：已經找到 Root Cause，準備結案
+{{
+    "step_by_step_reasoning": "根據探員的回報，我發現按鈕 0 的程式碼漏了...",
+    "is_resolved": true,
+    "next_search_request": null,
+    "final_report": "Root Cause: XXX。 修復建議: 將 YYY 改為 ZZZ。"
+}}
 """
 
 engineer_human_prompt = """
@@ -626,9 +672,19 @@ def engineer_node(state: GraphState):
         ("system", engineer_system_prompt),
         ("human", engineer_human_prompt)
     ])
+
+    structured_llm = llm.with_structured_output(EngineerEvaluation)
     
-    # 呼叫 LLM 並強制輸出結構化資料
-    analysis_chain = prompt | llm.with_structured_output(EngineerEvaluation)
+    # 建立管線
+    analysis_chain = (
+        prompt 
+        | structured_llm 
+    ).with_retry(
+        stop_after_attempt=3,
+        wait_exponential_jitter=True
+    )
+    
+    # 執行，並傳入格式說明給 LLM
     evaluation = analysis_chain.invoke({
         "steps": state["steps"],
         "logs": state["logs"],
@@ -670,7 +726,8 @@ def detective_node(state: GraphState):
         
         【嚴格守則】
         1. 誠實回報：如果工具回報錯誤（例如檔案找不到、路徑錯誤、無搜尋結果），請「原封不動」回傳錯誤訊息給工程師，絕對不要編造程式碼或隱瞞錯誤！
-        2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。"""),
+        2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。
+        3. 嚴格文字回報：請用自然語言回報你找到的內容，絕對不要直接回傳 JSON 格式的原始資料。"""),
         ("human", "【情報需求單】\n{query}\n\n【原始 Bug 步驟】\n{steps}\n\n【原始 Log】\n{logs}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
@@ -807,7 +864,8 @@ if __name__ == "__main__":
         initial_state = {
             "bug_id": report.bug_id,
             "steps": report.steps_to_reproduce,
-            "logs": "\n".join([f"=== {k} ===\n{v}" for k, v in report.logs.items()]),
+            # 將這裡的反斜線替換掉，保護 Agentic 流程的 JSON 解析
+            "logs": "\n".join([f"=== {k} ===\n{v}" for k, v in report.logs.items()]).replace("\\", "/"),
             "log_clues": clues.model_dump_json(),
             
             # 變數更名
