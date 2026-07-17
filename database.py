@@ -21,9 +21,6 @@ EXTENSION_MAPPING = {
     '.py': Language.PYTHON, '.js': Language.JS, '.ts': Language.TS,
     '.html': Language.HTML, '.css': Language.HTML, '.md': Language.MARKDOWN,
 }
-# 定義要忽略的資料夾
-IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
-
 
 def get_ast_parser_and_query(ext: str):
     """根據副檔名回傳對應的 Tree-sitter Parser 與 Query 語法"""
@@ -109,12 +106,12 @@ def ast_chunk_document(doc: Document) -> list[Document]:
     return ast_docs
 
 
-def get_files_from_repo(repo_path):
+def get_files_from_repo(repo_path: str, ignore_dirs: set[str]):
     """走訪資料夾，取得所有符合條件的檔案路徑"""
     file_paths = []
     for root, dirs, files in os.walk(repo_path):
         # 移除不需要掃描的資料夾
-        dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
         
         for file in files:
             ext = os.path.splitext(file)[1]
@@ -122,9 +119,9 @@ def get_files_from_repo(repo_path):
                 file_paths.append(os.path.join(root, file))
     return file_paths
 
-def gen_faii_index_from_path(repo_path: str, db_dir: str, embeddings):
+def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str], embeddings):
     print(f"開始掃描資料夾: {repo_path}")
-    file_paths = get_files_from_repo(repo_path)
+    file_paths = get_files_from_repo(repo_path, ignore_dirs)
     
     # 讀取檔案內容並建立 Document 物件
     documents = []
@@ -195,13 +192,13 @@ def gen_faii_index_from_path(repo_path: str, db_dir: str, embeddings):
     print(f"完成！BM25 檢索器已儲存至: {bm25_path}")
 
 
-def build_or_load_retriever(repo_dir: str, db_dir: str, embeddings) -> EnsembleRetriever:
+def build_or_load_retriever(repo_dir: str, db_dir: str, ignore_dirs: set[str], embeddings) -> EnsembleRetriever:
     """初始化並回傳混合檢索器 (EnsembleRetriever)"""
     bm25_path = os.path.join(db_dir, "bm25_retriever.pkl")
     faiss_index_path = os.path.join(db_dir, "index.faiss")
     
     if not (os.path.isdir(db_dir) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
-        gen_faii_index_from_path(repo_dir, db_dir, embeddings)
+        gen_faii_index_from_path(repo_dir, db_dir, ignore_dirs, embeddings)
 
     vector_db = FAISS.load_local(db_dir, embeddings, allow_dangerous_deserialization=True)
     faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 3})

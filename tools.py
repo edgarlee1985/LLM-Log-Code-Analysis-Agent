@@ -3,10 +3,8 @@ import subprocess
 from pathlib import Path
 from langchain_core.tools import tool
 
-IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
-
 # 定義給 Agent 使用的工具 (Tools)
-def create_agent_tools(repo_dir: str, ensemble_retriever):
+def create_agent_tools(repo_dir: str, ignore_dirs: set[str], ensemble_retriever):
     """
     接收 config 與 retriever，產生帶有依賴注入的 Agent Tools。
     """
@@ -35,7 +33,7 @@ def create_agent_tools(repo_dir: str, ensemble_retriever):
         candidates = []
         # 掃描 Repo 找出所有「檔名完全相同」的檔案
         for root, dirs, files in os.walk(target_repo_dir):
-            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS] # 濾除不需要掃描的資料夾
+            dirs[:] = [d for d in dirs if d not in ignore_dirs] # 濾除不需要掃描的資料夾
             if target_filename in files:
                 candidates.append(os.path.join(root, target_filename))
             

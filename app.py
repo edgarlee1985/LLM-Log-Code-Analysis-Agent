@@ -20,6 +20,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from tools import create_agent_tools
 from database import build_or_load_retriever
 
+IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
+
 # 創建 configparser 物件
 config = configparser.ConfigParser()
 config.read('config.ini', encoding='utf-8')
@@ -328,8 +330,8 @@ def detective_node(state: GraphState):
     repo_dir = config["Default"]["RepoDir"]
     db_dir = config["Default"]["FAISSDBDir"]
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
-    ensemble_retriever = build_or_load_retriever(repo_dir, db_dir, embeddings)
-    tools = create_agent_tools(repo_dir=repo_dir, ensemble_retriever=ensemble_retriever)
+    ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
+    tools = create_agent_tools(repo_dir=repo_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
     agent = create_tool_calling_agent(llm, tools, detective_prompt)
     agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
     
