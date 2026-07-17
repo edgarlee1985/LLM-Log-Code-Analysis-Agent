@@ -233,6 +233,27 @@ def gen_faii_index_from_path(repo_path):
         pickle.dump(bm25_retriever, f)
     print(f"完成！BM25 檢索器已儲存至: {bm25_path}")
 
+
+def build_or_load_retriever(repo_dir: str, db_dir: str, embeddings) -> EnsembleRetriever:
+    """初始化並回傳混合檢索器 (EnsembleRetriever)"""
+    bm25_path = os.path.join(db_dir, "bm25_retriever.pkl")
+    faiss_index_path = os.path.join(db_dir, "index.faiss")
+    
+    if not (os.path.isdir(db_dir) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
+        gen_faii_index_from_path(repo_dir)
+
+    vector_db = FAISS.load_local(db_dir, embeddings, allow_dangerous_deserialization=True)
+    faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
+
+    with open(bm25_path, "rb") as f:
+        bm25_retriever = pickle.load(f)
+
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, faiss_retriever],
+        weights=[0.5, 0.5]
+    )
+    return ensemble_retriever
+
 # ==========================================
 # 基礎設定 (使用本機 Ollama 舉例)
 # ==========================================
@@ -240,30 +261,6 @@ llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50,
 
 # 必須使用與建立時相同的 Embedding 模型
 embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
-
-print(f"檢查 {config["Default"]["FAISSDBDir"]} 是否存在")
-bm25_path = os.path.join(config["Default"]["FAISSDBDir"], "bm25_retriever.pkl")
-faiss_index_path = os.path.join(config["Default"]["FAISSDBDir"], "index.faiss")
-if not (os.path.isdir(config["Default"]["FAISSDBDir"]) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
-    gen_faii_index_from_path(config["Default"]["RepoDir"])
-
-# 載入本地端的 FAISS 資料庫
-# allow_dangerous_deserialization=True 是因為 FAISS 使用 pickle，載入信任的本地檔案時需開啟此設定
-vector_db = FAISS.load_local(config["Default"]["FAISSDBDir"], embeddings, allow_dangerous_deserialization=True)
-
-# 將 FAISS 轉為標準 Retriever
-faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
-
-# ================= 新增區塊：載入 BM25 並組合 =================
-bm25_path = os.path.join(config["Default"]["FAISSDBDir"], "bm25_retriever.pkl")
-with open(bm25_path, "rb") as f:
-    bm25_retriever = pickle.load(f)
-
-# 建立混合檢索器 (權重可依據測試結果微調，這裡先設定各 50%)
-ensemble_retriever = EnsembleRetriever(
-    retrievers=[bm25_retriever, faiss_retriever],
-    weights=[0.5, 0.5]
-)
 
 class SingleBugReport(BaseModel):
     """單一 Bug 的資料結構"""
@@ -573,6 +570,8 @@ def detective_node(state: GraphState):
     
     # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
     repo_dir = config["Default"]["RepoDir"]
+    db_dir = config["Default"]["FAISSDBDir"]
+    ensemble_retriever = build_or_load_retriever(repo_dir, db_dir, embeddings)
     tools = create_agent_tools(repo_dir=repo_dir, ensemble_retriever=ensemble_retriever)
     agent = create_tool_calling_agent(llm, tools, detective_prompt)
     agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
