@@ -156,11 +156,11 @@ def get_files_from_repo(repo_path):
                 file_paths.append(os.path.join(root, file))
     return file_paths
 
-def gen_faii_index_from_path(repo_path):
+def gen_faii_index_from_path(repo_path: str, db_dir: str, embeddings):
     print(f"開始掃描資料夾: {repo_path}")
     file_paths = get_files_from_repo(repo_path)
     
-    # 1. 讀取檔案內容並建立 Document 物件
+    # 讀取檔案內容並建立 Document 物件
     documents = []
     for path in file_paths:
         try:
@@ -173,7 +173,7 @@ def gen_faii_index_from_path(repo_path):
 
     print(f"共讀取了 {len(documents)} 個檔案。開始動態切塊...")
 
-    # 2. 動態切割文本 (Dynamic Text Splitting)
+    # 動態切割文本 (Dynamic Text Splitting)
     all_chunks = []
     
     # 建立一個通用的 Fallback/二次切塊 Splitter
@@ -210,25 +210,20 @@ def gen_faii_index_from_path(repo_path):
 
     print(f"所有檔案已切割成 {len(all_chunks)} 個區塊 (Chunks)。")
     
-    # 3. 初始化嵌入模型 (Embedding Model)
-    # 這裡使用 HuggingFace 開源且輕量的模型，適合一般文本與程式碼
-    print("正在下載/載入 Embedding 模型...")
-    embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
-    
-    # 4. 建立 FAISS 向量資料庫
+    # 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
     vector_db = FAISS.from_documents(all_chunks, embeddings)
 
-    # 5. 儲存資料庫到本地端
-    vector_db.save_local(config["Default"]["FAISSDBDir"])
-    print(f"完成！向量資料庫已儲存至: {config["Default"]["FAISSDBDir"]}")
+    # 儲存資料庫到本地端
+    vector_db.save_local(db_dir)
+    print(f"完成！向量資料庫已儲存至: {db_dir}")
 
     # ================= 新增區塊：建立並儲存 BM25 =================
     print("正在建立 BM25 關鍵字檢索器...")
     bm25_retriever = BM25Retriever.from_documents(all_chunks)
     bm25_retriever.k = 3
     
-    bm25_path = os.path.join(config["Default"]["FAISSDBDir"], "bm25_retriever.pkl")
+    bm25_path = os.path.join(db_dir, "bm25_retriever.pkl")
     with open(bm25_path, "wb") as f:
         pickle.dump(bm25_retriever, f)
     print(f"完成！BM25 檢索器已儲存至: {bm25_path}")
@@ -240,7 +235,7 @@ def build_or_load_retriever(repo_dir: str, db_dir: str, embeddings) -> EnsembleR
     faiss_index_path = os.path.join(db_dir, "index.faiss")
     
     if not (os.path.isdir(db_dir) and os.path.exists(bm25_path) and os.path.exists(faiss_index_path)):
-        gen_faii_index_from_path(repo_dir)
+        gen_faii_index_from_path(repo_dir, db_dir, embeddings)
 
     vector_db = FAISS.load_local(db_dir, embeddings, allow_dangerous_deserialization=True)
     faiss_retriever = vector_db.as_retriever(search_kwargs={"k": 3})
