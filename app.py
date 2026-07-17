@@ -12,12 +12,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
-
-from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings
-
-
-from langchain_text_splitters import Language
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -30,68 +25,15 @@ config = configparser.ConfigParser()
 config.read('config.ini', encoding='utf-8')
 
 # ==========================================
-# 基礎設定 (使用本機 Ollama 舉例)
+# 結構化資料模型 (Pydantic Models)
 # ==========================================
-llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
-
 class SingleBugReport(BaseModel):
     """單一 Bug 的資料結構"""
     bug_id: str = Field(default="", description="Bug 的唯一識別碼，例如: 'bug_000001'")
     steps_to_reproduce: str = Field(default="", description="記錄重現步驟，通常為 bug_xxxxxx.txt 內的文字內容")
     logs: Dict[str, str] = Field(default_factory=dict, description="紀錄該 bug 底下所有的 log，格式為 { 'application.log_1': 'log內容...' }")
 
-def read_bug_report(report_dir: str) -> List[SingleBugReport]:
-    """
-    從指定目錄讀取所有的 Bug reports 並轉換為 SingleBugReport 物件列表。
-    """
-    base_path = Path(report_dir)
-    bug_reports: List[SingleBugReport] = []
-
-    # 檢查目標資料夾是否存在
-    if not base_path.exists() or not base_path.is_dir():
-        print(f"警告: 找不到目錄 {report_dir}")
-        return bug_reports
-
-    # 遍歷 base_path 下的所有項目
-    for bug_dir in base_path.iterdir():
-        # 確認該項目是資料夾，且名稱符合 "bug_" 開頭的格式
-        if bug_dir.is_dir() and bug_dir.name.startswith("bug_"):
-            bug_id = bug_dir.name
-            steps_to_reproduce = ""
-            logs: Dict[str, str] = {}
-            
-            # 1. 讀取操作步驟 txt 檔 (預期檔名為 bug_id.txt)
-            txt_file_path = bug_dir / f"{bug_id}.txt"
-            if txt_file_path.exists() and txt_file_path.is_file():
-                # 建議加上 encoding="utf-8" 避免跨平台中文編碼錯誤
-                with open(txt_file_path, "r", encoding="utf-8") as f:
-                    steps_to_reproduce = f.read()
-            else:
-                print(f"警告: {bug_id} 目錄下找不到 {bug_id}.txt")
-            
-            # 2. 讀取目錄下的所有 application.log_x 檔案
-            for file_path in bug_dir.iterdir():
-                if file_path.is_file() and file_path.name.startswith("application.log"):
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        logs[file_path.name] = f.read()
-            
-            # 將收集到的資料建立為 SingleBugReport 模型並加入列表
-            report = SingleBugReport(
-                bug_id=bug_id,
-                steps_to_reproduce=steps_to_reproduce,
-                logs=logs
-            )
-            bug_reports.append(report)
-
-    # 可依據 bug_id 進行排序，確保回傳結果的一致性
-    bug_reports.sort(key=lambda x: x.bug_id)
-    
-    return bug_reports
-
-# ==========================================
-# 步驟一：從 Log 中萃取「精準線索」（Log Parsing）
-# ==========================================
-# 1. 定義預期的 Log 結構
+# 定義預期的 Log 結構
 class LogClues(BaseModel):
     error_type: Optional[str] = Field(default=None, description="明確的錯誤類型，如 TypeError，若無則留空")
     file_name: Optional[str] = Field(
@@ -101,25 +43,42 @@ class LogClues(BaseModel):
     line_number: Optional[int] = Field(default=-1, description="錯誤發生的行號，若無則為 -1")
     semantic_issue: str = Field(default="", description="將 Log 的行為總結為一句語意描述，例如：'事件迴圈重複觸發'")
 
-def parse_report(bug_report: SingleBugReport) -> LogClues:
-    """使用 LLM 將雜亂的 Log 轉換為結構化線索"""
-    
-    # 由於 bug_report.logs 是 Dict[str, str]，我們將其組合成單一字串
-    # 加上檔名標籤 (例如 === application.log_1 ===)，讓 LLM 能區分不同的 log 來源
-    combined_logs = "\n\n".join(
-        f"=== {filename} ===\n{content}" 
-        for filename, content in bug_report.logs.items()
-    )
+class DetectiveCommand(BaseModel):
+    """工程師開給探員的情報需求單"""
+    hypothesis: str = Field(default="", description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
+    action_type: str = Field(default="", description="要執行的檢索類型：READ_FILE, SEMANTIC_SEARCH, EXACT_KEYWORD 等")
+    target_value: str = Field(default="", description="對應的關鍵字、檔案路徑或語意描述")
+    focus_point: str = Field(default="", description="請探員特別注意什麼？例如：'請幫我確認這個 class 有沒有繼承 BaseUser'")
 
-    # 將 Windows 路徑的反斜線替換為正斜線，避免 JSON 跳脫字元崩潰
-    combined_logs = combined_logs.replace("\\", "/")
-    
-    # 如果 logs 是空的，給予預設提示避免 LLM 混淆
-    if not combined_logs.strip():
-        combined_logs = "此 Bug 沒有任何對應的 Log 紀錄。"
+class EngineerEvaluation(BaseModel):
+    """工程師的深度分析與決策報告"""
+    step_by_step_reasoning: str = Field(default="", description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
+    is_resolved: bool = Field(default=False, description="是否已經找到 Root Cause 並能提出修復方案？")
+    next_search_request: Optional[DetectiveCommand] = Field(default=None, description="如果尚未解決，指派給探員的下一步檢索指令")
+    final_report: Optional[str] = Field(default=None, description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一個專為「AI 檢索探員 (RAG Agent)」提供精確搜索彈藥的【資深技術日誌萃取引擎】。
+
+# ==========================================
+# 全局狀態 (GraphState)
+# ==========================================
+class GraphState(TypedDict):
+    bug_id: str
+    steps: str
+    logs: str
+    log_clues: str
+    
+    # 使用 operator.add 讓每次的調查紀錄自動附加，形成對話歷史
+    investigation_history: Annotated[List[str], operator.add] 
+    
+    # 存放 Engineer 開出的具體指令 (DetectiveCommand 的 dict 格式)
+    current_request: Optional[dict] 
+    
+    iterations: int
+    is_resolved: bool
+    final_report: str
+
+#==============================================================================================================
+rag_agent_system_prompt = """你是一個專為「AI 檢索探員 (RAG Agent)」提供精確搜索彈藥的【資深技術日誌萃取引擎】。
 你收到的原始資料可能混雜了「QA/RD 的口語對話」、「測試步驟」以及「系統崩潰日誌 (Log/Stack Trace)」。
 
 【你的核心任務】
@@ -141,68 +100,9 @@ def parse_report(bug_report: SingleBugReport) -> LogClues:
    - ❌ 錯誤示範 (太口語)："QA 說按下結帳按鈕後畫面卡住了，RD 覺得可能是 API 沒回傳，叫我看一下 login log。"
    - ✅ 正確示範 (具檢索價值)："觸發 Checkout 按鈕後發生 timeout，疑似 PaymentGateway 模組中的 fetch_user_token 未正確處理空值回傳。"
 
-請保持冷靜、客觀，忽略無關痛癢的對話，輸出最精煉的技術線索。"""),
-        ("human", "【原始 Bug 報告與 Log 紀錄】\n{raw_log}")
-    ])
-    
-    # 結合 LCEL 與 Structured Output 確保回傳 Pydantic 格式
-    parser_chain = prompt | llm.with_structured_output(LogClues)
-    
-    # 將組合好的 logs 字串傳遞給 prompt 中的 {raw_log} 變數
-    return parser_chain.invoke({"raw_log": combined_logs})
+請保持冷靜、客觀，忽略無關痛癢的對話，輸出最精煉的技術線索。"""
 
-
-# ==========================================
-# 步驟二：建立程式碼的檢索機制（Codebase RAG - Tools）
-# ==========================================
-
-
-
-# ==========================================
-# 步驟三：導入 Agentic 迭代排查（Agentic Workflow）
-# ==========================================
-
-# ==========================================
-# 結構化資料模型 (Pydantic Models)
-# ==========================================
-class DetectiveCommand(BaseModel):
-    """工程師開給探員的情報需求單"""
-    hypothesis: str = Field(default="", description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
-    action_type: str = Field(default="", description="要執行的檢索類型：READ_FILE, SEMANTIC_SEARCH, EXACT_KEYWORD 等")
-    target_value: str = Field(default="", description="對應的關鍵字、檔案路徑或語意描述")
-    focus_point: str = Field(default="", description="請探員特別注意什麼？例如：'請幫我確認這個 class 有沒有繼承 BaseUser'")
-
-class EngineerEvaluation(BaseModel):
-    """工程師的深度分析與決策報告"""
-    step_by_step_reasoning: str = Field(default="", description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
-    is_resolved: bool = Field(default=False, description="是否已經找到 Root Cause 並能提出修復方案？")
-    next_search_request: Optional[DetectiveCommand] = Field(default=None, description="如果尚未解決，指派給探員的下一步檢索指令")
-    final_report: Optional[str] = Field(default=None, description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
-
-# ==========================================
-# 全局狀態 (GraphState)
-# ==========================================
-
-class GraphState(TypedDict):
-    bug_id: str
-    steps: str
-    logs: str
-    log_clues: str
-    
-    # 使用 operator.add 讓每次的調查紀錄自動附加，形成對話歷史
-    investigation_history: Annotated[List[str], operator.add] 
-    
-    # 存放 Engineer 開出的具體指令 (DetectiveCommand 的 dict 格式)
-    current_request: Optional[dict] 
-    
-    iterations: int
-    is_resolved: bool
-    final_report: str
-
-# ==========================================
-# 3. Prompts (工程師的 System & Human Prompt)
-# ==========================================
-
+# =================================================================================
 engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責帶領團隊進行複雜系統的除錯 (Debugging)。
 你的唯一目標是找出系統 Bug 的根本原因 (Root Cause) 並提出精確的修復方案。
 
@@ -262,11 +162,102 @@ engineer_human_prompt = """
 2. 如果你已經確定根本原因，請將 is_resolved 設為 true，並給出 final_report。
 """
 
+# =================================================================================
+detective_system_prompt = """你是一個精準的程式碼檢索探員。
+        你的任務是根據工程師的需求單，使用適當的工具去尋找程式碼。
+        
+        【嚴格守則】
+        1. 誠實回報：如果工具回報錯誤（例如檔案找不到、路徑錯誤、無搜尋結果），請「原封不動」回傳錯誤訊息給工程師，絕對不要編造程式碼或隱瞞錯誤！
+        2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。
+        3. 嚴格文字回報：請用自然語言回報你找到的內容，絕對不要直接回傳 JSON 格式的原始資料。"""
 
 # ==========================================
-# 4. 核心節點 (Nodes)
+# 基礎設定 (使用本機 Ollama 舉例)
 # ==========================================
+llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
 
+def read_bug_report(report_dir: str) -> List[SingleBugReport]:
+    """
+    從指定目錄讀取所有的 Bug reports 並轉換為 SingleBugReport 物件列表。
+    """
+    base_path = Path(report_dir)
+    bug_reports: List[SingleBugReport] = []
+
+    # 檢查目標資料夾是否存在
+    if not base_path.exists() or not base_path.is_dir():
+        print(f"警告: 找不到目錄 {report_dir}")
+        return bug_reports
+
+    # 遍歷 base_path 下的所有項目
+    for bug_dir in base_path.iterdir():
+        # 確認該項目是資料夾，且名稱符合 "bug_" 開頭的格式
+        if bug_dir.is_dir() and bug_dir.name.startswith("bug_"):
+            bug_id = bug_dir.name
+            steps_to_reproduce = ""
+            logs: Dict[str, str] = {}
+            
+            # 1. 讀取操作步驟 txt 檔 (預期檔名為 bug_id.txt)
+            txt_file_path = bug_dir / f"{bug_id}.txt"
+            if txt_file_path.exists() and txt_file_path.is_file():
+                # 建議加上 encoding="utf-8" 避免跨平台中文編碼錯誤
+                with open(txt_file_path, "r", encoding="utf-8") as f:
+                    steps_to_reproduce = f.read()
+            else:
+                print(f"警告: {bug_id} 目錄下找不到 {bug_id}.txt")
+            
+            # 2. 讀取目錄下的所有 application.log_x 檔案
+            for file_path in bug_dir.iterdir():
+                if file_path.is_file() and file_path.name.startswith("application.log"):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        logs[file_path.name] = f.read()
+            
+            # 將收集到的資料建立為 SingleBugReport 模型並加入列表
+            report = SingleBugReport(
+                bug_id=bug_id,
+                steps_to_reproduce=steps_to_reproduce,
+                logs=logs
+            )
+            bug_reports.append(report)
+
+    # 可依據 bug_id 進行排序，確保回傳結果的一致性
+    bug_reports.sort(key=lambda x: x.bug_id)
+    
+    return bug_reports
+
+# ==========================================
+# 步驟一：從 Log 中萃取「精準線索」（Log Parsing）
+# ==========================================
+def parse_report(bug_report: SingleBugReport) -> LogClues:
+    """使用 LLM 將雜亂的 Log 轉換為結構化線索"""
+    
+    # 由於 bug_report.logs 是 Dict[str, str]，我們將其組合成單一字串
+    # 加上檔名標籤 (例如 === application.log_1 ===)，讓 LLM 能區分不同的 log 來源
+    combined_logs = "\n\n".join(
+        f"=== {filename} ===\n{content}" 
+        for filename, content in bug_report.logs.items()
+    )
+
+    # 將 Windows 路徑的反斜線替換為正斜線，避免 JSON 跳脫字元崩潰
+    combined_logs = combined_logs.replace("\\", "/")
+    
+    # 如果 logs 是空的，給予預設提示避免 LLM 混淆
+    if not combined_logs.strip():
+        combined_logs = "此 Bug 沒有任何對應的 Log 紀錄。"
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", rag_agent_system_prompt),
+        ("human", "【原始 Bug 報告與 Log 紀錄】\n{raw_log}")
+    ])
+    
+    # 結合 LCEL 與 Structured Output 確保回傳 Pydantic 格式
+    parser_chain = prompt | llm.with_structured_output(LogClues)
+    
+    # 將組合好的 logs 字串傳遞給 prompt 中的 {raw_log} 變數
+    return parser_chain.invoke({"raw_log": combined_logs})
+
+# ==========================================
+# 核心節點 (Nodes)
+# ==========================================
 def engineer_node(state: GraphState):
     print(f"\n[Engineer Node] 開始深度分析 (第 {state['iterations']} 次迭代)...")
     
@@ -311,7 +302,6 @@ def engineer_node(state: GraphState):
         "final_report": evaluation.final_report or ""
     }
 
-
 def detective_node(state: GraphState):
     print(f"\n[Detective Node] 啟動 (第 {state['iterations']} 次迭代)")
     
@@ -329,13 +319,7 @@ def detective_node(state: GraphState):
     
     # 給探員的專屬 Prompt (補齊了 steps 和 logs，讓它有全局 Context)
     detective_prompt = ChatPromptTemplate.from_messages([
-        ("system", """你是一個精準的程式碼檢索探員。
-        你的任務是根據工程師的需求單，使用適當的工具去尋找程式碼。
-        
-        【嚴格守則】
-        1. 誠實回報：如果工具回報錯誤（例如檔案找不到、路徑錯誤、無搜尋結果），請「原封不動」回傳錯誤訊息給工程師，絕對不要編造程式碼或隱瞞錯誤！
-        2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。
-        3. 嚴格文字回報：請用自然語言回報你找到的內容，絕對不要直接回傳 JSON 格式的原始資料。"""),
+        ("system", detective_system_prompt),
         ("human", "【情報需求單】\n{query}\n\n【原始 Bug 步驟】\n{steps}\n\n【原始 Log】\n{logs}"),
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
