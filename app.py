@@ -173,11 +173,6 @@ detective_system_prompt = """你是一個精準的程式碼檢索探員。
         2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。
         3. 嚴格文字回報：請用自然語言回報你找到的內容，絕對不要直接回傳 JSON 格式的原始資料。"""
 
-# ==========================================
-# 基礎設定 (使用本機 Ollama 舉例)
-# ==========================================
-llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
-
 def read_bug_report(report_dir: str) -> List[SingleBugReport]:
     """
     從指定目錄讀取所有的 Bug reports 並轉換為 SingleBugReport 物件列表。
@@ -229,7 +224,7 @@ def read_bug_report(report_dir: str) -> List[SingleBugReport]:
 # ==========================================
 # 步驟一：從 Log 中萃取「精準線索」（Log Parsing）
 # ==========================================
-def parse_report(bug_report: SingleBugReport) -> LogClues:
+def parse_report(llm, bug_report: SingleBugReport) -> LogClues:
     """使用 LLM 將雜亂的 Log 轉換為結構化線索"""
     
     # 由於 bug_report.logs 是 Dict[str, str]，我們將其組合成單一字串
@@ -258,112 +253,110 @@ def parse_report(bug_report: SingleBugReport) -> LogClues:
     return parser_chain.invoke({"raw_log": combined_logs})
 
 # ==========================================
-# 核心節點 (Nodes)
+# LangGraph Workflow 建立 (使用閉包封裝 LLM 與 Tools)
 # ==========================================
-def engineer_node(state: GraphState):
-    print(f"\n[Engineer Node] 開始深度分析 (第 {state['iterations']} 次迭代)...")
-    
-    # 將歷史紀錄從 List[str] 組裝成單一字串，讓 LLM 閱讀
-    if not state.get("investigation_history"):
-        history_text = "目前尚無調查紀錄，這是第一次推論。請根據 Log 提出第一個假設並指派探員去檢索。"
-    else:
-        history_text = "\n\n".join(state["investigation_history"])
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", engineer_system_prompt),
-        ("human", engineer_human_prompt)
-    ])
-
-    structured_llm = llm.with_structured_output(EngineerEvaluation)
-    
-    # 建立管線
-    analysis_chain = (
-        prompt 
-        | structured_llm 
-    ).with_retry(
-        stop_after_attempt=3,
-        wait_exponential_jitter=True
-    )
-    
-    # 執行，並傳入格式說明給 LLM
-    evaluation = analysis_chain.invoke({
-        "steps": state["steps"],
-        "logs": state["logs"],
-        "investigation_history": history_text
-    })
-    
-    print(f"狀態評估: is_resolved={evaluation.is_resolved}")
-    if not evaluation.is_resolved:
-        print(f"下一步假設: {evaluation.next_search_request.hypothesis if evaluation.next_search_request else '無'}")
-        print(f"下一步行動: {evaluation.next_search_request.action_type if evaluation.next_search_request else '無'}")
+def build_debugging_graph(llm, tools):
+    # ==========================================
+    # 核心節點 (Nodes)
+    # ==========================================
+    def engineer_node(state: GraphState):
+        print(f"\n[Engineer Node] 開始深度分析 (第 {state['iterations']} 次迭代)...")
         
-    return {
-        # 將 Pydantic 物件轉成 dict 存入 state (相容性較好)
-        "current_request": evaluation.next_search_request.model_dump() if evaluation.next_search_request else None,
-        "is_resolved": evaluation.is_resolved,
-        "final_report": evaluation.final_report or ""
-    }
+        # 將歷史紀錄從 List[str] 組裝成單一字串，讓 LLM 閱讀
+        if not state.get("investigation_history"):
+            history_text = "目前尚無調查紀錄，這是第一次推論。請根據 Log 提出第一個假設並指派探員去檢索。"
+        else:
+            history_text = "\n\n".join(state["investigation_history"])
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", engineer_system_prompt),
+            ("human", engineer_human_prompt)
+        ])
 
-def detective_node(state: GraphState):
-    print(f"\n[Detective Node] 啟動 (第 {state['iterations']} 次迭代)")
-    
-    # 從 Engineer 的需求單中提取資訊，如果沒有就使用最初的 log clues
-    if state.get("current_request"):
-        req = state["current_request"]
-        search_query = (
-            f"【目標】: {req.get('target_value')}\n"
-            f"【任務類型】: {req.get('action_type')}\n"
-            f"【工程師的假設】: {req.get('hypothesis')}\n"
-            f"【關注點】: {req.get('focus_point')}"
+        structured_llm = llm.with_structured_output(EngineerEvaluation)
+        
+        # 建立管線
+        analysis_chain = (
+            prompt 
+            | structured_llm 
+        ).with_retry(
+            stop_after_attempt=3,
+            wait_exponential_jitter=True
         )
-    else:
-        search_query = f"請根據以下 Log 線索自由檢索：{state['log_clues']}"
-    
-    # 給探員的專屬 Prompt (補齊了 steps 和 logs，讓它有全局 Context)
-    detective_prompt = ChatPromptTemplate.from_messages([
-        ("system", detective_system_prompt),
-        ("human", "【情報需求單】\n{query}\n\n【原始 Bug 步驟】\n{steps}\n\n【原始 Log】\n{logs}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-    
-    # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
-    repo_dir = config["Default"]["RepoDir"]
-    db_dir = config["Default"]["FAISSDBDir"]
-    embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
-    ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
-    tools = create_agent_tools(repo_dir=repo_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
-    agent = create_tool_calling_agent(llm, tools, detective_prompt)
-    agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
-    
-    # 執行檢索
-    result = agent_runner.invoke({
-        "query": search_query,
-        "steps": state["steps"],
-        "logs": state["logs"]
-    })
-    
-    # 建立這次調查的結構化報告字串，並打包進陣列
-    new_report = (
-        f"=== 第 {state['iterations']} 次調查 ===\n"
-        f"📥 收到指令:\n{search_query}\n"
-        f"📤 調查結果:\n{result['output']}\n"
-    )
-    
-    return {
-        "investigation_history": [new_report], # 使用 operator.add 會自動把這個陣列接在舊紀錄後面
-        "iterations": state["iterations"] + 1
-    }
+        
+        # 執行，並傳入格式說明給 LLM
+        evaluation = analysis_chain.invoke({
+            "steps": state["steps"],
+            "logs": state["logs"],
+            "investigation_history": history_text
+        })
+        
+        print(f"狀態評估: is_resolved={evaluation.is_resolved}")
+        if not evaluation.is_resolved:
+            print(f"下一步假設: {evaluation.next_search_request.hypothesis if evaluation.next_search_request else '無'}")
+            print(f"下一步行動: {evaluation.next_search_request.action_type if evaluation.next_search_request else '無'}")
+            
+        return {
+            # 將 Pydantic 物件轉成 dict 存入 state (相容性較好)
+            "current_request": evaluation.next_search_request.model_dump() if evaluation.next_search_request else None,
+            "is_resolved": evaluation.is_resolved,
+            "final_report": evaluation.final_report or ""
+        }
 
-# --- 路由判斷邏輯 ---
-def should_continue(state: GraphState):
-    # 如果已經解決，或者迭代次數超過上限 (例如 5 次)，就走向終點
-    if state.get("is_resolved", False) or state["iterations"] >= 5:
-        return "end"
-    # 否則，退回給 Detective 繼續找資料
-    return "continue"
+    def detective_node(state: GraphState):
+        print(f"\n[Detective Node] 啟動 (第 {state['iterations']} 次迭代)")
+        
+        # 從 Engineer 的需求單中提取資訊，如果沒有就使用最初的 log clues
+        if state.get("current_request"):
+            req = state["current_request"]
+            search_query = (
+                f"【目標】: {req.get('target_value')}\n"
+                f"【任務類型】: {req.get('action_type')}\n"
+                f"【工程師的假設】: {req.get('hypothesis')}\n"
+                f"【關注點】: {req.get('focus_point')}"
+            )
+        else:
+            search_query = f"請根據以下 Log 線索自由檢索：{state['log_clues']}"
+        
+        # 給探員的專屬 Prompt (補齊了 steps 和 logs，讓它有全局 Context)
+        detective_prompt = ChatPromptTemplate.from_messages([
+            ("system", detective_system_prompt),
+            ("human", "【情報需求單】\n{query}\n\n【原始 Bug 步驟】\n{steps}\n\n【原始 Log】\n{logs}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ])
+        
+        # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
+        agent = create_tool_calling_agent(llm, tools, detective_prompt)
+        agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
+        
+        # 執行檢索
+        result = agent_runner.invoke({
+            "query": search_query,
+            "steps": state["steps"],
+            "logs": state["logs"]
+        })
+        
+        # 建立這次調查的結構化報告字串，並打包進陣列
+        new_report = (
+            f"=== 第 {state['iterations']} 次調查 ===\n"
+            f"📥 收到指令:\n{search_query}\n"
+            f"📤 調查結果:\n{result['output']}\n"
+        )
+        
+        return {
+            "investigation_history": [new_report], # 使用 operator.add 會自動把這個陣列接在舊紀錄後面
+            "iterations": state["iterations"] + 1
+        }
 
-# --- 組合與編譯 LangGraph ---
-def build_debugging_graph():
+    # --- 路由判斷邏輯 ---
+    def should_continue(state: GraphState):
+        # 如果已經解決，或者迭代次數超過上限 (例如 5 次)，就走向終點
+        if state.get("is_resolved", False) or state["iterations"] >= 5:
+            return "end"
+        # 否則，退回給 Detective 繼續找資料
+        return "continue"
+    
+    #============================================================
     workflow = StateGraph(GraphState)
     
     # 1. 註冊 Nodes
@@ -450,13 +443,19 @@ def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
 if __name__ == "__main__":
     bug_reports = read_bug_report(config["Default"]["BugReportDir"])
     
+    repo_dir = config["Default"]["RepoDir"]
+    db_dir = config["Default"]["FAISSDBDir"]
+    llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
+    embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
+    ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
+    tools = create_agent_tools(repo_dir=repo_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
     # 建立 Graph
-    debugger_app = build_debugging_graph()
+    debugger_app = build_debugging_graph(llm, tools)
 
     for report in bug_reports:
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
-        clues = parse_report(report)
+        clues = parse_report(llm, report)
         print(f"萃取線索: {clues}\n")
         
         # 初始化 State
