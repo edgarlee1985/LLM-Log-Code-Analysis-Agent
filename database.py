@@ -263,7 +263,8 @@ def get_files_from_repo(repo_path: str, ignore_dirs: set[str]):
         for file in files:
             ext = os.path.splitext(file)[1]
             if ext in ALLOWED_EXTENSIONS:
-                file_paths.append(os.path.join(root, file))
+                file_path = os.path.join(root, file).replace('\\', '/')
+                file_paths.append(file_path)
     return file_paths
 
 def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str], embeddings):
