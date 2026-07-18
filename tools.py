@@ -1,10 +1,11 @@
 import os
 import subprocess
 from pathlib import Path
+import json
 from langchain_core.tools import tool
 
 # 定義給 Agent 使用的工具 (Tools)
-def create_agent_tools(repo_dir: str, ignore_dirs: set[str], ensemble_retriever):
+def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemble_retriever):
     """
     接收 config 與 retriever，產生帶有依賴注入的 Agent Tools。
     """
@@ -165,5 +166,67 @@ def create_agent_tools(repo_dir: str, ignore_dirs: set[str], ensemble_retriever)
         except subprocess.CalledProcessError:
             return f"找不到包含精確關鍵字 '{keyword}' 的程式碼。"
     
+    @tool
+    def analyze_class_architecture(class_name: str) -> str:
+        """
+        當你需要知道某個 Class 的父類別是誰、被哪些子類別實作，或是包含哪些「成員變數」時使用。
+        輸入 Class 名稱，回傳該類別的完整架構（繼承關係、實作類別、成員變數清單）。
+        """
+        # 確保這裡的路徑與你存檔的路徑一致
+        tree_path = os.path.join(db_dir, "class_dependency_tree.json") 
+        
+        if not os.path.exists(tree_path):
+            return "錯誤：相依樹檔案不存在，請確認是否已成功建構索引。"
+            
+        try:
+            with open(tree_path, "r", encoding="utf-8") as f:
+                graph = json.load(f)
+        except Exception as e:
+            return f"讀取相依樹檔案失敗: {e}"
+            
+        if class_name not in graph:
+            # 提供模糊搜尋建議，幫助 LLM 修正拼字錯誤
+            similar_classes = [k for k in graph.keys() if class_name.lower() in k.lower()]
+            if similar_classes:
+                return f"找不到精確符合 '{class_name}' 的類別。您是指以下類別嗎？ {', '.join(similar_classes[:5])}"
+            return f"架構圖中完全找不到類別 '{class_name}'。"
+            
+        data = graph[class_name]
+        report = [f"📊 【類別架構報告】: {class_name}"]
+        
+        # 1. 所在檔案
+        if data.get("source_files"):
+            report.append(f"- 📍 所在檔案: {', '.join(data['source_files'])}")
+        
+        # 2. 繼承關係 (Inherits)
+        if data.get("inherits"):
+            report.append(f"- ⬆️ 繼承自 (Base Classes): {', '.join(data['inherits'])}")
+        else:
+            report.append("- ⬆️ 繼承自: 無 (Root Class)")
+            
+        # 3. 子類別實作 (Implemented By)
+        if data.get("implemented_by"):
+            report.append(f"- ⬇️ 被以下子類別實作 (Derived Classes): {', '.join(data['implemented_by'])}")
+            
+        # 4. 成員變數 (Composes) - 針對最新字典結構進行排版
+        composes_list = data.get("composes", [])
+        if composes_list:
+            report.append("- 🧩 內部成員變數 (Composition):")
+            
+            # 限制輸出數量避免 Context Window 爆掉 (假設最多列出 20 個)
+            limit = 20
+            for item in composes_list[:limit]:
+                var_type = item.get("type", "UnknownType")
+                var_name = item.get("name", "unknown_var")
+                # 排版成 C++ 的宣告風格，這對 LLM 來說最具備語意提示效果
+                report.append(f"    * {var_type} {var_name};")
+                
+            if len(composes_list) > limit:
+                report.append(f"    * ... (還有 {len(composes_list) - limit} 個成員變數未列出)")
+        else:
+            report.append("- 🧩 內部成員變數: 無或未偵測到")
+            
+        return "\n".join(report)
+
     # 回傳所有的 tools 列表
-    return [semantic_code_search, read_code_snippet, get_git_blame, exact_keyword_search]
+    return [semantic_code_search, read_code_snippet, get_git_blame, exact_keyword_search, analyze_class_architecture]

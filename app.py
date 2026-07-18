@@ -448,7 +448,7 @@ if __name__ == "__main__":
     llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
     ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
-    tools = create_agent_tools(repo_dir=repo_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
+    tools = create_agent_tools(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
     # 建立 Graph
     debugger_app = build_debugging_graph(llm, tools)
 
