@@ -10,6 +10,7 @@ import operator
 # 現代 LangChain 工具與 LCEL
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaEmbeddings
@@ -78,6 +79,45 @@ class GraphState(TypedDict):
     iterations: int
     is_resolved: bool
     final_report: str
+
+#==============================================================================================================
+class TokenTrackerCallback(BaseCallbackHandler):
+    def __init__(self):
+        # 用於單次 Bug 分析的統計
+        self.current_prompt_tokens = 0
+        self.current_completion_tokens = 0
+        self.current_total_tokens = 0
+        
+        # 用於所有 Bug 的全局累計
+        self.all_prompt_tokens = 0
+        self.all_completion_tokens = 0
+        self.all_total_tokens = 0
+
+    def reset_current(self):
+        """在進入下一個 Bug 迴圈前，清空當前統計"""
+        self.current_prompt_tokens = 0
+        self.current_completion_tokens = 0
+        self.current_total_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        # 捕捉每次 LLM 回應的 token 消耗
+        for generation in response.generations[0]:
+            if hasattr(generation, 'message') and hasattr(generation.message, 'usage_metadata'):
+                usage = generation.message.usage_metadata
+                if usage:
+                    in_tokens = usage.get('input_tokens', 0)
+                    out_tokens = usage.get('output_tokens', 0)
+                    total = usage.get('total_tokens', 0)
+                    
+                    # 累加到單次 Bug 的變數
+                    self.current_prompt_tokens += in_tokens
+                    self.current_completion_tokens += out_tokens
+                    self.current_total_tokens += total
+                    
+                    # 同時累加到全局總計的變數
+                    self.all_prompt_tokens += in_tokens
+                    self.all_completion_tokens += out_tokens
+                    self.all_total_tokens += total
 
 #==============================================================================================================
 rag_agent_system_prompt = """你是一個專為「AI 檢索探員 (RAG Agent)」提供精確搜索彈藥的【資深技術日誌萃取引擎】。
@@ -445,7 +485,17 @@ if __name__ == "__main__":
     
     repo_dir = config["Default"]["RepoDir"]
     db_dir = config["Default"]["FAISSDBDir"]
-    llm = ChatOllama(model=config["Default"]["ModelName"], temperature=0.0, seed=50, repeat_penalty=1.2, num_ctx=8192, num_predict=4096) # 也可以替換成 Llama-3.1 或 OpenAI
+
+    
+    # 建立統計實例
+    token_tracker = TokenTrackerCallback()
+    llm = ChatOllama(model=config["Default"]["ModelName"],
+                     temperature=0.0,
+                     seed=50, repeat_penalty=1.2,
+                     num_ctx=8192,
+                     num_predict=4096,
+                     callbacks=[token_tracker])
+    
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
     ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
     tools = create_agent_tools(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
@@ -453,6 +503,7 @@ if __name__ == "__main__":
     debugger_app = build_debugging_graph(llm, tools)
 
     for report in bug_reports:
+        token_tracker.reset_current()
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
         clues = parse_report(llm, report)
@@ -480,8 +531,21 @@ if __name__ == "__main__":
         final_state = debugger_app.invoke(initial_state)
         print("\n🏆 --- 最終 Bug 報告 --- 🏆")
         print(final_state.get("final_report", "無法在迭代次數內找到完整的 Root Cause。以下是目前分析：\n" + final_state.get("missing_information", "")))
+        
+        # 迴圈尾聲：印出【單次 Bug】的消耗
+        print(f"\n📊 --- {report.bug_id} Token 消耗 --- 📊")
+        print(f"輸入量 : {token_tracker.current_prompt_tokens}")
+        print(f"生成量 : {token_tracker.current_completion_tokens}")
+        print(f"單次總用量 : {token_tracker.current_total_tokens}")
+        print("=" * 40)
 
         #print("--- 階段二 & 三：啟動 Agentic 迭代排查 ---")
         #final_report = run_debugging_agent(report, clues)
         #print("\n--- 最終 Bug 報告 ---")
         #print(final_report)
+        
+    # 當所有 Bug 都處理完畢跳出迴圈後，印出【全局總累計】
+    print("\n🌍 --- 全局總 Token 消耗統計 --- 🌍")
+    print(f"總輸入量 : {token_tracker.all_prompt_tokens}")
+    print(f"總生成量 : {token_tracker.all_completion_tokens}")
+    print(f"全局總累計用量: {token_tracker.all_total_tokens}")
