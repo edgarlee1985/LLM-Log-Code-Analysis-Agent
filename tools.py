@@ -150,7 +150,7 @@ def create_agent_tools(repo_dir: str, ignore_dirs: set[str], ensemble_retriever)
             
             result = subprocess.check_output(
                 cmd, 
-                cwd=config["Default"]["RepoDir"], 
+                cwd=repo_dir, 
                 text=True, 
                 encoding='utf-8',    # 👈 強制要求以 UTF-8 解碼
                 errors='replace',    # 👈 遇到無法解碼的亂碼時，替換成  而非崩潰
