@@ -1,6 +1,7 @@
 import os
 import pickle
 from pathlib import Path
+import json
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
@@ -54,8 +55,75 @@ def get_ast_parser_and_query(ext: str):
         
     return parser, ts_language, query_str
 
+def extract_class_dependencies(class_node, source_bytes: bytes):
+    """
+    走訪 class/struct 節點，萃取類別名稱、繼承的父類別，以及成員變數的型別與名稱。
+    """
+    class_name = "Unknown"
+    dependencies = {
+        "inherits": set(),
+        "composes": set()
+    }
+
+    # 1. 尋找類別名稱
+    for child in class_node.children:
+        if child.type in ['type_identifier', 'identifier']:
+            class_name = source_bytes[child.start_byte:child.end_byte].decode('utf-8')
+            break
+
+    # 2. 遞迴走訪 class 內部
+    def walk(node):
+        # --- 修正：更強大的繼承 (Inheritance) 捕捉邏輯 ---
+        if node.type == 'base_class':
+            # C++ 的 base_class 包含修飾詞 (public/private/virtual) 與真正的型別節點
+            # 我們用排除法：只要不是修飾詞，那就是我們要的父類別名稱！
+            for c in node.children:
+                if c.type not in ['access_specifier', 'virtual']:
+                    base_name = source_bytes[c.start_byte:c.end_byte].decode('utf-8').strip()
+                    if base_name:
+                        dependencies["inherits"].add(base_name)
+                        
+        # --- 保留前次修正：捕捉變數名稱 (Composition) ---
+        elif node.type == 'field_declaration':
+            field_type = None
+            field_name = None
+            
+            for c in node.children:
+                # 抓取型別 (支援基礎型別、模板、指標等)
+                if c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'primitive_type']:
+                    field_type = source_bytes[c.start_byte:c.end_byte].decode('utf-8')
+                else:
+                    # 遞迴抓取變數名稱 (應付陣列、指標的複雜宣告)
+                    def find_identifier(n):
+                        if n.type in ['field_identifier', 'identifier']:
+                            return source_bytes[n.start_byte:n.end_byte].decode('utf-8')
+                        for child in n.children:
+                            res = find_identifier(child)
+                            if res: return res
+                        return None
+                    
+                    found_name = find_identifier(c)
+                    if found_name:
+                        field_name = found_name
+
+            if field_type:
+                dependencies["composes"].add((field_type, field_name or "unknown"))
+        
+        # 繼續往下走訪其他節點 (確保嵌套的 struct/class 也能處理)
+        for child in node.children:
+            walk(child)
+
+    walk(class_node)
+    
+    # 格式化輸出
+    formatted_composes = [
+        {"type": t, "name": n} for t, n in dependencies["composes"]
+    ]
+    
+    return class_name, list(dependencies["inherits"]), formatted_composes
+
 def ast_chunk_document(doc: Document) -> list[Document]:
-    """將單一檔案原始碼轉化為基於 AST 的多個區塊 (僅支援 tree-sitter >= 0.22.0)"""
+    """將單一檔案原始碼轉化為基於 AST 的多個區塊，並注入相依性 Metadata"""
     source_path = doc.metadata.get("source", "")
     ext = os.path.splitext(source_path)[1].lower()
     
@@ -90,12 +158,20 @@ def ast_chunk_document(doc: Document) -> list[Document]:
         start_line = node.start_point[0] + 1
         end_line = node.end_point[0] + 1
         
+        # 基礎 Metadata[cite: 1]
         metadata = {
             "source": source_path,
             "start_line": start_line,
             "end_line": end_line,
             "ast_type": capture_name
         }
+        
+        # 如果是 class 或 struct，萃取相依性
+        if capture_name in ['class', 'struct']:
+            cls_name, inherits, composes = extract_class_dependencies(node, source_bytes)
+            metadata["class_name"] = cls_name
+            metadata["inherits"] = inherits
+            metadata["composes"] = composes
         
         numbered_snippet = "\n".join(
             [f"{start_line + i} | {line}" for i, line in enumerate(snippet.split('\n'))]
@@ -105,6 +181,77 @@ def ast_chunk_document(doc: Document) -> list[Document]:
         
     return ast_docs
 
+def build_global_dependency_tree(all_chunks: list[Document], save_dir: str):
+    """掃描所有 Chunk 建立全域的 Class Dependency Tree 並儲存"""
+    print("正在建構全域類別相依樹 (Global Class Dependency Tree)...")
+    
+    dependency_graph = {}
+    
+    for chunk in all_chunks:
+        meta = chunk.metadata
+        if meta.get("ast_type") in ['class', 'struct']:
+            cls_name = meta.get("class_name")
+            
+            # 過濾掉無效名稱或未命名結構
+            if not cls_name or cls_name == "Unknown":
+                continue
+                
+            # 建立節點
+            if cls_name not in dependency_graph:
+                dependency_graph[cls_name] = {
+                    "source_files": [],
+                    "inherits": [],
+                    "composes": [],
+                    "implemented_by": [] # 反向記錄：誰繼承了我
+                }
+            
+            # 寫入來源檔案
+            source = meta.get("source")
+            if source not in dependency_graph[cls_name]["source_files"]:
+                dependency_graph[cls_name]["source_files"].append(source)
+                
+            # 寫入相依關係 (使用 set 去重複後轉回 list)
+            current_inherits = set(dependency_graph[cls_name]["inherits"])
+            current_inherits.update(meta.get("inherits", []))
+            dependency_graph[cls_name]["inherits"] = list(current_inherits)
+            
+            # 1. 將現有的 composes 轉為 set of tuples
+            current_composes_set = {
+                (d["type"], d["name"]) for d in dependency_graph[cls_name].get("composes", [])
+            }
+            
+            # 2. 將新進來的 composes 也轉為 set of tuples 並加入
+            new_composes = meta.get("composes", [])
+            if new_composes:
+                new_composes_set = {
+                    (d.get("type", "unknown"), d.get("name", "unknown")) 
+                    for d in new_composes if isinstance(d, dict)
+                }
+                current_composes_set.update(new_composes_set)
+            
+            # 3. 轉回 list of dicts 存回 dependency_graph
+            dependency_graph[cls_name]["composes"] = [
+                {"type": t, "name": n} for t, n in current_composes_set
+            ]
+
+    # 建立反向關係 (誰繼承了這個 Base Class？)
+    for child_cls, data in dependency_graph.items():
+        for base_cls in data["inherits"]:
+            if base_cls in dependency_graph:
+                if child_cls not in dependency_graph[base_cls]["implemented_by"]:
+                    dependency_graph[base_cls]["implemented_by"].append(child_cls)
+
+    # 儲存為 JSON 供後續 Agent 讀取
+    tree_path = os.path.join(save_dir, "class_dependency_tree.json")
+
+    # 確保目標資料夾存在，如果已存在則忽略
+    os.makedirs(save_dir, exist_ok=True)
+
+    with open(tree_path, "w", encoding="utf-8") as f:
+        json.dump(dependency_graph, f, indent=4, ensure_ascii=False)
+        
+    print(f"完成！相依樹已儲存至: {tree_path}")
+    return dependency_graph
 
 def get_files_from_repo(repo_path: str, ignore_dirs: set[str]):
     """走訪資料夾，取得所有符合條件的檔案路徑"""
@@ -172,6 +319,9 @@ def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str],
                 all_chunks.extend(fallback_splitter.split_documents([doc]))
 
     print(f"所有檔案已切割成 {len(all_chunks)} 個區塊 (Chunks)。")
+
+    # 呼叫建立樹狀圖的函數
+    build_global_dependency_tree(all_chunks, db_dir)
     
     # 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
