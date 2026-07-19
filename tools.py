@@ -338,8 +338,27 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
                 report.append(f"- ... (還有其他 {len(files_dict) - 15} 個檔案包含此引用)")
                 break
             
-            line_str = ", ".join(map(str, lines))
-            report.append(f"- 📄 {file_path} (行號: {line_str})")
+            report.append(f"📄 檔案: {file_path}")
+            
+            # 嘗試讀取真實檔案內容，擷取該行的程式碼
+            actual_path = resolve_best_repo_path(file_path, repo_dir)
+            if actual_path and os.path.exists(actual_path):
+                try:
+                    with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
+                        all_lines = f.readlines()
+                        for line_num in lines:
+                            # 確保行號在合理範圍內
+                            if 0 < line_num <= len(all_lines):
+                                code_line = all_lines[line_num - 1].strip()
+                                report.append(f"  - [行 {line_num}] {code_line}")
+                except Exception:
+                    # 若檔案讀取失敗，退回只顯示行號
+                    line_str = ", ".join(map(str, lines))
+                    report.append(f"  - (行號: {line_str})")
+            else:
+                 line_str = ", ".join(map(str, lines))
+                 report.append(f"  - (行號: {line_str})")
+
             file_count += 1
             
         return "\n".join(report)
