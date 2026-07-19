@@ -137,7 +137,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def exact_keyword_search(keyword: str, file_extension: str = "") -> str:
         """
-        當已知明確的變數名稱、函數名稱或錯誤訊息關鍵字時使用。
+        當已知明確的變數名稱、函數名稱或錯誤訊息關鍵字，但不知道哪個檔案時使用。
         進行整個 Codebase 的精確字串比對（類似 grep）。
         可以選擇性提供副檔名過濾 (例如: '.cpp' 或 '.py')。
         """
@@ -172,6 +172,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         當你需要查看特定檔案中某個類別 (Class) 或函數 (Function) 的完整程式碼時使用。
         請傳入「檔案路徑提示」與「符號名稱」，系統會尋找該檔案內相符的符號並回傳。
         若有多個同名或部分相符的符號（例如多載函數），會一併回傳完整程式碼。
+        注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
         """
         print(f"read_symbol_code, file_path_hint = {file_path_hint}, target_symbol = {target_symbol}")
         
