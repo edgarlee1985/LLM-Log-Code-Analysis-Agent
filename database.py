@@ -46,8 +46,8 @@ def get_ast_parser_and_query(ext: str):
         
         # 抓取 C/C++ 的 class、struct 與 function
         query_str = """
-        (class_specifier) @class
-        (struct_specifier) @struct
+        (class_specifier body: (field_declaration_list)) @class
+        (struct_specifier body: (field_declaration_list)) @struct
         (function_definition) @function
         """
     else:
