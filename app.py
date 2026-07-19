@@ -3,6 +3,7 @@ import configparser
 from typing import List, Dict, Optional
 from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field
+from pydantic import ValidationError
 from pathlib import Path
 
 import operator
@@ -11,6 +12,7 @@ import operator
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaEmbeddings
@@ -150,23 +152,32 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 
 你目前正在與一位「檢索探員 (Detective)」合作。探員負責深入 Codebase 撈取程式碼，而你負責指揮他。
 
+【🎯 核心除錯戰略 (Core Debugging Strategy)】
+1. 由廣入深 (Macro-to-Micro)：
+   - 優先要求探員大範圍閱讀程式碼。若已知檔案與出錯位置，但不知道確切相關函數與變數，請指示探員讀取該處前後 50-100 行的完整邏輯。
+   - 嚴禁提早陷入單點追蹤。在尚未掌握完整 Context 前，不要輕易指派探員去尋找單一變數或函數的全域引用。
+2. 減少上下文碎片化：
+   - 盡量在一次指令中要求獲取完整的執行路徑，避免「查 A 函數 -> 發現裡面有 B 變數 -> 再下指令查 B 變數」的低效行為。
+3. 失敗快速回退 (Fail-Fast & Backtrack)：
+   - 檢視「歷史調查紀錄」時，若發現連續兩次相同的檢索方向都【查無資料】或【無法定位】，請立刻放棄該方向。重新檢視原始 Log，切換另一種調查策略。
+
 【💡 工作模式：假設驅動 (Hypothesis-Driven)】
 你必須嚴格遵循以下思考循環：
 1. 觀察 (Observe)：仔細閱讀使用者的 Bug 重現步驟與原始系統 Log。
-2. 回顧 (Review)：檢視你與探員的「歷史調查紀錄」。特別留意【執行失敗 / 查無資料】的回報，這代表你先前的假設路徑或關鍵字錯誤，你必須改變策略，絕對不要重複發送相同的無效指令。
+2. 回顧 (Review)：檢視你與探員的「歷史調查紀錄」。特別留意上一次的假設是否被推翻。
 3. 推理 (Reasoning)：將 Log 線索與探員帶回的程式碼進行交叉比對，找出邏輯斷層。
 4. 假設 (Hypothesis)：針對可能出錯的邏輯提出具體假設（例如："我懷疑 `calculate_total` 沒有處理空陣列"）。
-5. 行動 (Action)：如果你確信已找到 Root Cause，宣告結案並撰寫報告；若證據不足，開立精確的情報需求單給探員。
+5. 行動 (Action)：如果你確信已找到 Root Cause，宣告結案並撰寫報告；若證據不足，開立符合「由廣入深」戰略的情報需求單給探員。
 
 【🚨 核心守則】
-1. 絕不憑空捏造：絕對不要幻想或猜測未被檢索出來的程式碼邏輯。如果你沒親眼看到那段程式碼，就請探員去讀取。
-2. 保持專注：只針對導致「當前 Bug Log」的程式碼進行排查，不要發散去檢查無關的模組或提出無謂的重構建議。
-3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，不要瞎猜路徑，請指示探員使用語意搜尋 (SEMANTIC_SEARCH) 來尋找相關邏輯。
+1. 絕不憑空捏造：絕對不要幻想或猜測未被檢索出來的程式碼邏輯。
+2. 保持專注：只針對導致「當前 Bug Log」的程式碼進行排查。
+3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，不要瞎猜路徑，請指示探員使用語意搜尋。
 
 【📝 輸出要求】
-你必須嚴格遵守 JSON 格式輸出。請根據你是否已經找到 Root Cause，選擇以下兩種 JSON 格式之一進行輸出：
+請根據你是否已經找到 Root Cause，決定 "is_resolved" 的布林值。
 
-情況 A：尚未解決，需要探員繼續檢索
+【輸出範例 - 請完全照抄此結構，不要加任何其他字】
 {{
     "step_by_step_reasoning": "我剛剛看到...這代表...我接下來需要確認...",
     "is_resolved": false,
@@ -177,14 +188,6 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
         "focus_point": "檢查 OnButtonClikced 的實作邏輯"
     }},
     "final_report": ""
-}}
-
-情況 B：已經找到 Root Cause，準備結案
-{{
-    "step_by_step_reasoning": "根據探員的回報，我發現按鈕 0 的程式碼漏了...",
-    "is_resolved": true,
-    "next_search_request": null,
-    "final_report": "Root Cause: XXX。 修復建議: 將 YYY 改為 ZZZ。"
 }}
 """
 
@@ -314,22 +317,46 @@ def build_debugging_graph(llm, tools):
         ])
 
         structured_llm = llm.with_structured_output(EngineerEvaluation)
-        
+
         # 建立管線
         analysis_chain = (
-            prompt 
-            | structured_llm 
-        ).with_retry(
-            stop_after_attempt=3,
-            wait_exponential_jitter=True
+            prompt | structured_llm
         )
         
-        # 執行，並傳入格式說明給 LLM
-        evaluation = analysis_chain.invoke({
+         # 執行
+        evaluation = {}
+        llm_input = {
             "steps": state["steps"],
             "logs": state["logs"],
-            "investigation_history": history_text
-        })
+            "investigation_history": history_text,
+        }
+        try:
+            evaluation = analysis_chain.invoke(llm_input)
+            
+        except (Exception, ValidationError) as e:
+            print(f"⚠️ 解析 JSON 或生成失敗: {e}")
+            print(f"evaluation_dict = {evaluation}")
+            formatted_prompt = prompt.format_messages(**llm_input)
+        
+            print("\n====== [Debug] LLM 實際收到的完整 Prompt ======")
+            for msg in formatted_prompt:
+                # msg.type 會是 'system', 'human', 'ai' 等
+                print(f"[{msg.type.upper()}]:\n{msg.content}\n")
+            print("===============================================\n")
+
+            # 發生極端例外時的 Fallback：強制指派探員繼續隨機調查，避免流程中斷
+            fallback_request = DetectiveCommand(
+                hypothesis="前一次 LLM 生成 JSON 崩潰，嘗試重新理解 Log",
+                action_type="SEMANTIC_SEARCH",
+                target_value="尋找導致崩潰的關鍵字",
+                focus_point="請重新檢視檔案並提供精簡回報"
+            )
+            evaluation = EngineerEvaluation(
+                step_by_step_reasoning="LLM JSON 解析失敗，啟動備援檢索方案。",
+                is_resolved=False,
+                next_search_request=fallback_request,
+                final_report=None
+            )
         
         print(f"狀態評估: is_resolved={evaluation.is_resolved}")
         if not evaluation.is_resolved:
@@ -356,7 +383,10 @@ def build_debugging_graph(llm, tools):
                 f"【關注點】: {req.get('focus_point')}"
             )
         else:
-            search_query = f"請根據以下 Log 線索自由檢索：{state['log_clues']}"
+            search_query = (
+                f"這是第一次調查。請根據以下 Log 線索：{state['log_clues']}\n"
+                f"【指令】：請只挑選「最可能發生問題的 1 個檔案或 1 個函數」進行檢索。不要一次查詢多個目標！"
+            )
         
         # 給探員的專屬 Prompt (補齊了 steps 和 logs，讓它有全局 Context)
         detective_prompt = ChatPromptTemplate.from_messages([
@@ -492,8 +522,9 @@ if __name__ == "__main__":
     llm = ChatOllama(model=config["Default"]["ModelName"],
                      temperature=0.0,
                      seed=50, repeat_penalty=1.2,
-                     num_ctx=8192,
+                     num_ctx=16384,
                      num_predict=4096,
+                     format="json",
                      callbacks=[token_tracker])
     
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
