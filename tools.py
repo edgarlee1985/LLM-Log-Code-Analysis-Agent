@@ -69,7 +69,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def read_code_snippet(file_path_hint: str, start_line: int, end_line: int) -> str:
         """
-        當已知檔案名稱與行號時，讀取特定範圍的程式碼。
+        當已知檔案名稱與行號，但不確定與哪些函數、變數有關時使用，讀取指定範圍的程式碼查找線索。
         注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
         """
         print(f"read_code_snippet, file_path_hint = {file_path_hint}, start_line = {start_line}, end_line = {end_line}")
@@ -165,7 +165,73 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             return result
         except subprocess.CalledProcessError:
             return f"找不到包含精確關鍵字 '{keyword}' 的程式碼。"
-    
+
+    @tool
+    def read_symbol_code(file_path_hint: str, target_symbol: str) -> str:
+        """
+        當你需要查看特定檔案中某個類別 (Class) 或函數 (Function) 的完整程式碼時使用。
+        請傳入「檔案路徑提示」與「符號名稱」，系統會尋找該檔案內相符的符號並回傳。
+        若有多個同名或部分相符的符號（例如多載函數），會一併回傳完整程式碼。
+        """
+        print(f"read_symbol_code, file_path_hint = {file_path_hint}, target_symbol = {target_symbol}")
+        
+        # 1. 先利用已有的智慧比對，找出真實的檔案路徑
+        actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+        if not actual_path:
+            return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
+
+        # 2. 讀取 AST 字典
+        meta_path = os.path.join(db_dir, "symbol_bounds.json")
+        if not os.path.exists(meta_path):
+            return "系統錯誤：AST 字典不存在。"
+            
+        with open(meta_path, "r", encoding="utf-8") as f:
+            ast_data = json.load(f)
+            
+        # 3. 找出對應檔案的 AST 實體 (注意路徑格式的比對)
+        target_entities = None
+        target_file_key = None
+        for dict_file_path, entities in ast_data.items():
+            # 使用 os.path.normpath 確保斜線與反斜線的格式統一，避免比對失敗
+            if os.path.normpath(dict_file_path) == os.path.normpath(actual_path):
+                target_entities = entities
+                target_file_key = dict_file_path
+                break
+                
+        if not target_entities:
+            return f"讀取失敗：在 AST 字典中沒有 '{file_path_hint}' 的解析紀錄。"
+
+        # 4. 收集「所有」符合的邊界，解決同名或多載 (Overloading) 的問題
+        matched_bounds = []
+        
+        # 找類別
+        for cls_name, bounds in target_entities.get("classes", {}).items():
+            if target_symbol.lower() in cls_name.lower():
+                matched_bounds.append((f"Class: {cls_name}", bounds["start_line"], bounds["end_line"]))
+                
+        # 找函數
+        for func_name, bounds in target_entities.get("functions", {}).items():
+            if target_symbol.lower() in func_name.lower():
+                matched_bounds.append((f"Function: {func_name}", bounds["start_line"], bounds["end_line"]))
+
+        if not matched_bounds:
+            return f"讀取失敗：在檔案 '{file_path_hint}' 中找不到名稱包含 '{target_symbol}' 的函數或類別。"
+
+        # 5. 去讀取真實檔案並擷取所有相符片段
+        try:
+            with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+                
+            results = []
+            for symbol_desc, start_line, end_line in matched_bounds:
+                snippet = "".join(lines[start_line-1:end_line])
+                results.append(f"【{symbol_desc}】(行號 {start_line}-{end_line})\n{snippet}")
+                
+            return f"在檔案 '{target_file_key}' 中找到 {len(matched_bounds)} 個相符的符號：\n\n" + "\n---\n\n".join(results)
+            
+        except Exception as e:
+            return f"讀取檔案失敗: {e}"
+
     @tool
     def analyze_class_architecture(class_name: str) -> str:
         """
@@ -227,6 +293,60 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             report.append("- 🧩 內部成員變數: 無或未偵測到")
             
         return "\n".join(report)
+    
+    @tool
+    def find_symbol_references(symbol_name: str) -> str:
+        """
+        當你需要知道某個「變數、函數或類別」在哪些檔案的哪些行數被「呼叫」或「使用」時使用。
+        這有助於追蹤變數的修改來源，或是函數的呼叫鏈 (Call Stack)。
+        請傳入精確的符號名稱 (例如: 'calculate_total' 或 'user_id')。
+        """
+        print(f"find_symbol_references, symbol_name = {symbol_name}")
+        
+        # 讀取剛剛在 Indexer 階段建立的字典
+        ref_path = os.path.join(db_dir, "symbol_references.json")
+        if not os.path.exists(ref_path):
+            return "系統錯誤：Symbol Reference 字典不存在。請確認是否已成功建構索引。"
+            
+        try:
+            with open(ref_path, "r", encoding="utf-8") as f:
+                ref_data = json.load(f)
+        except Exception as e:
+            return f"讀取字典檔案失敗: {e}"
+            
+        # 檢查符號是否存在
+        if symbol_name not in ref_data:
+            # 提供模糊搜尋建議，幫助 LLM 修正拼字錯誤
+            similar_symbols = [k for k in ref_data.keys() if symbol_name.lower() in k.lower()][:5]
+            if similar_symbols:
+                return f"找不到精確符合 '{symbol_name}' 的 Reference。您是指以下符號嗎？ {', '.join(similar_symbols)}"
+            return f"在專案中完全找不到 '{symbol_name}' 被使用的紀錄。"
+            
+        # 整理並排版輸出結果給 LLM
+        files_dict = ref_data[symbol_name]
+        report = [f"🔗 【Reference 搜尋結果】: '{symbol_name}'"]
+        
+        # 計算總共被引用的次數
+        total_refs = sum(len(lines) for lines in files_dict.values())
+        report.append(f"共找到 {total_refs} 處使用紀錄：")
+        
+        # 限制輸出數量避免 Context Window 爆掉
+        file_count = 0
+        for file_path, lines in files_dict.items():
+            if file_count >= 15: # 最多列出 15 個檔案
+                report.append(f"- ... (還有其他 {len(files_dict) - 15} 個檔案包含此引用)")
+                break
+            
+            line_str = ", ".join(map(str, lines))
+            report.append(f"- 📄 {file_path} (行號: {line_str})")
+            file_count += 1
+            
+        return "\n".join(report)
 
     # 回傳所有的 tools 列表
-    return [semantic_code_search, read_code_snippet, get_git_blame, exact_keyword_search, analyze_class_architecture]
+    return [semantic_code_search,
+            read_code_snippet,
+            get_git_blame, exact_keyword_search,
+            read_symbol_code,
+            analyze_class_architecture,
+            find_symbol_references]

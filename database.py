@@ -253,6 +253,107 @@ def build_global_dependency_tree(all_chunks: list[Document], save_dir: str):
     print(f"完成！相依樹已儲存至: {tree_path}")
     return dependency_graph
 
+def build_symbol_bounds_index(all_chunks: list[Document], save_dir: str):
+    """掃描所有 AST Chunk，建立【檔案路徑 -> 實體名稱 -> 行號邊界】的快速查詢字典"""
+    print("正在建構 AST 邊界查詢字典 (Symbol Bounds Index)...")
+    symbol_bounds_index = {}
+    
+    for chunk in all_chunks:
+        meta = chunk.metadata
+        ast_type = meta.get("ast_type")
+        source = meta.get("source")
+        
+        if not source:
+            continue
+
+        if source not in symbol_bounds_index:
+            symbol_bounds_index[source] = {"classes": {}, "functions": {}}
+            
+        # 針對類別
+        if ast_type in ['class', 'struct']:
+            cls_name = meta.get("class_name")
+            if cls_name and cls_name != "Unknown":
+                symbol_bounds_index[source]["classes"][cls_name] = {
+                    "start_line": meta.get("start_line"),
+                    "end_line": meta.get("end_line")
+                }
+                
+        # 針對函數 (如果你的 AST chunk 有抓取函數)
+        elif ast_type == 'function':
+            # 這裡簡單取第一行作為識別 (實際應用可依賴 tree-sitter 更精確的函數名稱抓取)
+            func_signature = chunk.page_content.split('\n')[0].strip()
+            # 取括號前的名稱作為簡略 Key
+            func_name = func_signature.split('(')[0].split(' ')[-1].strip()
+            if func_name:
+                symbol_bounds_index[source]["functions"][func_name] = {
+                    "start_line": meta.get("start_line"),
+                    "end_line": meta.get("end_line"),
+                    "signature": func_signature
+                }
+
+    meta_path = os.path.join(save_dir, "symbol_bounds.json")
+    os.makedirs(save_dir, exist_ok=True)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(symbol_bounds_index, f, indent=4, ensure_ascii=False)
+        
+    print(f"完成！AST 邊界字典已儲存至: {meta_path}")
+
+def build_symbol_references(documents: list, save_dir: str):
+    """
+    掃描所有原始檔案的 AST，建立全域的 Symbol Reference 查詢字典。
+    記錄每個變數、函數在哪些檔案的哪些行數被使用。
+    """
+    print("正在建構 Symbol Reference 字典 (Symbol References)...")
+    reference_graph = {} # 格式: { symbol_name: { source_path: set(line_numbers) } }
+
+    for doc in documents:
+        # 統一將路徑斜線轉換為正斜線
+        source_path = doc.metadata.get("source", "")
+        ext = os.path.splitext(source_path)[1].lower()
+        
+        # 取得對應語言的 parser[cite: 3]
+        parser, ts_language, _ = get_ast_parser_and_query(ext) 
+        
+        if not parser or not ts_language:
+            continue
+
+        source_bytes = doc.page_content.encode('utf-8')
+        tree = parser.parse(source_bytes)
+
+        # 遞迴走訪整棵樹，蒐集所有的 identifier 節點
+        def walk_for_refs(node):
+            # 針對變數名稱、函數名稱、類別名稱進行捕捉
+            if node.type in ['identifier', 'field_identifier', 'type_identifier']:
+                symbol_name = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
+                
+                # 過濾掉長度過短 (例如 i, j) 的無意義變數，縮小字典體積
+                if len(symbol_name) >= 3: 
+                    line_number = node.start_point[0] + 1
+                    
+                    if symbol_name not in reference_graph:
+                        reference_graph[symbol_name] = {}
+                    if source_path not in reference_graph[symbol_name]:
+                        reference_graph[symbol_name][source_path] = set()
+                        
+                    reference_graph[symbol_name][source_path].add(line_number)
+                    
+            for child in node.children:
+                walk_for_refs(child)
+
+        walk_for_refs(tree.root_node)
+
+    # 將 set 轉為 sorted list 以利 JSON 序列化儲存
+    for symbol, files in reference_graph.items():
+        for file in files:
+            reference_graph[symbol][file] = sorted(list(files[file]))
+
+    ref_path = os.path.join(save_dir, "symbol_references.json")
+    os.makedirs(save_dir, exist_ok=True)
+    with open(ref_path, "w", encoding="utf-8") as f:
+        json.dump(reference_graph, f, indent=4, ensure_ascii=False)
+        
+    print(f"完成！Symbol Reference 字典已儲存至: {ref_path}")
+
 def get_files_from_repo(repo_path: str, ignore_dirs: set[str]):
     """走訪資料夾，取得所有符合條件的檔案路徑"""
     file_paths = []
@@ -281,6 +382,8 @@ def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str],
                 documents.append(doc)
         except Exception as e:
             print(f"讀取檔案失敗 {path}: {e}")
+
+    build_symbol_references(documents, db_dir)
 
     print(f"共讀取了 {len(documents)} 個檔案。開始動態切塊...")
 
@@ -323,6 +426,7 @@ def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str],
 
     # 呼叫建立樹狀圖的函數
     build_global_dependency_tree(all_chunks, db_dir)
+    build_symbol_bounds_index(all_chunks, db_dir)
     
     # 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
