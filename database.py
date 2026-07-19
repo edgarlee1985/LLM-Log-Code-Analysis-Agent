@@ -73,17 +73,17 @@ def extract_class_dependencies(class_node, source_bytes: bytes):
 
     # 2. 遞迴走訪 class 內部
     def walk(node):
-        # --- 修正：更強大的繼承 (Inheritance) 捕捉邏輯 ---
-        if node.type == 'base_class':
-            # C++ 的 base_class 包含修飾詞 (public/private/virtual) 與真正的型別節點
-            # 我們用排除法：只要不是修飾詞，那就是我們要的父類別名稱！
+        # 繼承 (Inheritance) 捕捉邏輯 ---
+        if node.type in ['base_class', 'base_class_clause']:
             for c in node.children:
-                if c.type not in ['access_specifier', 'virtual']:
+                # 排除標點符號與存取修飾詞，抓取真正的類別名稱
+                if c.type not in ['access_specifier', 'virtual', ':', ',']:
                     base_name = source_bytes[c.start_byte:c.end_byte].decode('utf-8').strip()
-                    if base_name:
+                    # 避免抓到空的或者是 base_class 自身的複合節點
+                    if base_name and c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'identifier']:
                         dependencies["inherits"].add(base_name)
                         
-        # --- 保留前次修正：捕捉變數名稱 (Composition) ---
+        # 捕捉變數名稱 (Composition)
         elif node.type == 'field_declaration':
             field_type = None
             field_name = None
