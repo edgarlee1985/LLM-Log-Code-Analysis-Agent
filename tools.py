@@ -375,6 +375,26 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
                 report.append(f"    * ... (還有 {len(composes_list) - limit} 個成員變數未列出)")
         else:
             report.append("- 🧩 內部成員變數: 無或未偵測到")
+
+        # 5. 類別方法 (Methods)
+        methods_list = data.get("methods", [])
+        if methods_list:
+            report.append("- 🛠️ 類別方法 (Methods):")
+            
+            limit = 20
+            for item in methods_list[:limit]:
+                tags = []
+                if item.get("is_virtual"): tags.append("virtual")
+                if item.get("is_override"): tags.append("override")
+                
+                # 如果有 tag，就加上 [virtual, override] 的標籤
+                tag_str = f" [{', '.join(tags)}]" if tags else ""
+                report.append(f"    * {item.get('name')}(){tag_str}")
+                
+            if len(methods_list) > limit:
+                report.append(f"    * ... (還有 {len(methods_list) - limit} 個方法未列出)")
+        else:
+            report.append("- 🛠️ 類別方法: 無或未偵測到")
             
         return "\n".join(report)
     

@@ -57,12 +57,13 @@ def get_ast_parser_and_query(ext: str):
 
 def extract_class_dependencies(class_node, source_bytes: bytes):
     """
-    走訪 class/struct 節點，萃取類別名稱、繼承的父類別，以及成員變數的型別與名稱。
+    走訪 class/struct 節點，萃取類別名稱、繼承的父類別、成員變數，以及【成員方法 (包含 virtual/override 狀態)】。
     """
     class_name = "Unknown"
     dependencies = {
         "inherits": set(),
-        "composes": set()
+        "composes": set(),
+        "methods": []  # 新增：用來存放方法與其屬性
     }
 
     # 1. 尋找類別名稱
@@ -73,54 +74,93 @@ def extract_class_dependencies(class_node, source_bytes: bytes):
 
     # 2. 遞迴走訪 class 內部
     def walk(node):
-        # 繼承 (Inheritance) 捕捉邏輯 ---
+        # 繼承 (Inheritance) 捕捉邏輯
         if node.type in ['base_class', 'base_class_clause']:
             for c in node.children:
-                # 排除標點符號與存取修飾詞，抓取真正的類別名稱
                 if c.type not in ['access_specifier', 'virtual', ':', ',']:
                     base_name = source_bytes[c.start_byte:c.end_byte].decode('utf-8').strip()
-                    # 避免抓到空的或者是 base_class 自身的複合節點
                     if base_name and c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'identifier']:
                         dependencies["inherits"].add(base_name)
                         
-        # 捕捉變數名稱 (Composition)
-        elif node.type == 'field_declaration':
-            field_type = None
-            field_name = None
+        # --- 新增：捕捉類別方法與成員變數 ---
+        elif node.type in ['field_declaration', 'function_definition']:
+            is_function = False
+            method_name = None
+            is_virtual = False
+            is_override = False
             
-            for c in node.children:
-                # 抓取型別 (支援基礎型別、模板、指標等)
-                if c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'primitive_type']:
-                    field_type = source_bytes[c.start_byte:c.end_byte].decode('utf-8')
-                else:
-                    # 遞迴抓取變數名稱 (應付陣列、指標的複雜宣告)
-                    def find_identifier(n):
-                        if n.type in ['field_identifier', 'identifier']:
-                            return source_bytes[n.start_byte:n.end_byte].decode('utf-8')
-                        for child in n.children:
-                            res = find_identifier(child)
-                            if res: return res
-                        return None
+            # 內部遞迴：尋找 declarator 並偵測修飾詞
+            def analyze_member(n):
+                nonlocal is_function, method_name, is_virtual, is_override
+                
+                # 偵測 virtual 與 override 關鍵字
+                if n.type == 'virtual':
+                    is_virtual = True
+                elif n.type in ['virtual_specifier', 'override_specifier']:
+                    is_override = True
+                elif n.type == 'identifier':
+                    # 防呆：某些舊版 parser 可能將 override 視為純 identifier
+                    if source_bytes[n.start_byte:n.end_byte].decode('utf-8') == 'override':
+                        is_override = True
+                        
+                # 確認是否為函數宣告
+                if n.type == 'function_declarator':
+                    is_function = True
+                    for c in n.children:
+                        if c.type in ['identifier', 'field_identifier', 'destructor_name']:
+                            method_name = source_bytes[c.start_byte:c.end_byte].decode('utf-8')
+                            
+                for c in n.children:
+                    analyze_member(c)
                     
-                    found_name = find_identifier(c)
-                    if found_name:
-                        field_name = found_name
+            analyze_member(node)
+            
+            # 如果確認是函數，加入 methods 列表
+            if is_function and method_name:
+                dependencies["methods"].append({
+                    "name": method_name,
+                    "is_virtual": is_virtual,
+                    "is_override": is_override
+                })
+            # 如果不是函數 (就是一般的成員變數)，執行原有的 Composition 邏輯
+            elif node.type == 'field_declaration' and not is_function:
+                field_type = None
+                field_name = None
+                
+                for c in node.children:
+                    if c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'primitive_type']:
+                        field_type = source_bytes[c.start_byte:c.end_byte].decode('utf-8')
+                    else:
+                        def find_identifier(n):
+                            if n.type in ['field_identifier', 'identifier']:
+                                return source_bytes[n.start_byte:n.end_byte].decode('utf-8')
+                            for child in n.children:
+                                res = find_identifier(child)
+                                if res: return res
+                            return None
+                        
+                        found_name = find_identifier(c)
+                        if found_name:
+                            field_name = found_name
 
-            if field_type:
-                dependencies["composes"].add((field_type, field_name or "unknown"))
+                if field_type:
+                    dependencies["composes"].add((field_type, field_name or "unknown"))
         
-        # 繼續往下走訪其他節點 (確保嵌套的 struct/class 也能處理)
+        # 繼續往下走訪其他節點
         for child in node.children:
+            # 🛑 關鍵防呆：不要走入 function_definition 的 body，避免將函數內的區域變數誤認為類別成員
+            if node.type == 'function_definition' and child.type == 'compound_statement':
+                continue
             walk(child)
 
     walk(class_node)
     
-    # 格式化輸出
     formatted_composes = [
         {"type": t, "name": n} for t, n in dependencies["composes"]
     ]
     
-    return class_name, list(dependencies["inherits"]), formatted_composes
+    # 回傳值新增 methods
+    return class_name, list(dependencies["inherits"]), formatted_composes, dependencies["methods"]
 
 def ast_chunk_document(doc: Document) -> list[Document]:
     """將單一檔案原始碼轉化為基於 AST 的多個區塊，並注入相依性 Metadata"""
@@ -168,10 +208,11 @@ def ast_chunk_document(doc: Document) -> list[Document]:
         
         # 如果是 class 或 struct，萃取相依性
         if capture_name in ['class', 'struct']:
-            cls_name, inherits, composes = extract_class_dependencies(node, source_bytes)
+            cls_name, inherits, composes, methods = extract_class_dependencies(node, source_bytes)
             metadata["class_name"] = cls_name
             metadata["inherits"] = inherits
             metadata["composes"] = composes
+            metadata["methods"] = methods
         
         numbered_snippet = "\n".join(
             [f"{start_line + i} | {line}" for i, line in enumerate(snippet.split('\n'))]
@@ -202,6 +243,7 @@ def build_global_dependency_tree(all_chunks: list[Document], save_dir: str):
                     "source_files": [],
                     "inherits": [],
                     "composes": [],
+                    "methods": [],
                     "implemented_by": [] # 反向記錄：誰繼承了我
                 }
             
@@ -233,6 +275,22 @@ def build_global_dependency_tree(all_chunks: list[Document], save_dir: str):
             dependency_graph[cls_name]["composes"] = [
                 {"type": t, "name": n} for t, n in current_composes_set
             ]
+
+            new_methods = meta.get("methods", [])
+            if new_methods:
+                current_methods = {
+                    m["name"]: m for m in dependency_graph[cls_name].get("methods", [])
+                }
+                for m in new_methods:
+                    name = m["name"]
+                    if name not in current_methods:
+                        current_methods[name] = m
+                    else:
+                        # 只要有任何一個宣告帶有 virtual 或 override，就標記為 True
+                        current_methods[name]["is_virtual"] |= m["is_virtual"]
+                        current_methods[name]["is_override"] |= m["is_override"]
+                
+                dependency_graph[cls_name]["methods"] = list(current_methods.values())
 
     # 建立反向關係 (誰繼承了這個 Base Class？)
     for child_cls, data in dependency_graph.items():
