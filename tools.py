@@ -233,6 +233,89 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             return f"讀取檔案失敗: {e}"
 
     @tool
+    def read_function_by_line(file_path_hint: str, line_number: int) -> str:
+        """
+        【使用時機】當你從 Log 得知錯誤發生的「檔案名稱與具體行號」，想直接獲取包含該落點的「完整函數或類別程式碼」時使用。
+        【優勢】比 read_code_snippet 更精準，能自動透過 AST 分析切出完整的函數範圍，避免程式碼被截斷。
+        注意：file_path_hint 必須是絕對路徑或相對路徑，系統會自動進行智慧比對。
+        """
+        print(f"read_function_by_line, file_path_hint = {file_path_hint}, line_number = {line_number}")
+        
+        # 1. 找出真實的檔案路徑
+        actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+        if not actual_path:
+            return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
+
+        # 2. 讀取 AST 邊界字典
+        meta_path = os.path.join(db_dir, "symbol_bounds.json")
+        if not os.path.exists(meta_path):
+            return "系統錯誤：AST 字典 (symbol_bounds.json) 不存在。請確認是否已成功建構索引。"
+            
+        with open(meta_path, "r", encoding="utf-8") as f:
+            ast_data = json.load(f)
+            
+        # 3. 找出對應檔案的 AST 實體 (注意路徑格式的比對)
+        target_entities = None
+        target_file_key = None
+        for dict_file_path, entities in ast_data.items():
+            if os.path.normpath(dict_file_path) == os.path.normpath(actual_path):
+                target_entities = entities
+                target_file_key = dict_file_path
+                break
+                
+        if not target_entities:
+            return f"讀取失敗：在 AST 字典中沒有 '{file_path_hint}' 的解析紀錄，無法精準切出函數。請退回使用 read_code_snippet 工具。"
+
+        # 4. 尋找包含該行號的函數或類別
+        matched_symbol_type = None
+        matched_symbol_name = None
+        matched_bounds = None
+        
+        # 優先找函數 (錯誤落點最有可能在函數內部)
+        for func_name, bounds in target_entities.get("functions", {}).items():
+            if bounds["start_line"] <= line_number <= bounds["end_line"]:
+                # 處理巢狀函數 (Nested Function)：如果有多個函數包覆該行，取範圍最小的最精確
+                if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
+                    matched_symbol_type = "Function"
+                    matched_symbol_name = func_name
+                    matched_bounds = bounds
+
+        # 如果沒找到函數，退而求其次找類別 (錯誤可能發生在 class 的成員變數宣告區)
+        if not matched_bounds:
+            for cls_name, bounds in target_entities.get("classes", {}).items():
+                if bounds["start_line"] <= line_number <= bounds["end_line"]:
+                    if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
+                        matched_symbol_type = "Class"
+                        matched_symbol_name = cls_name
+                        matched_bounds = bounds
+
+        if not matched_bounds:
+             return f"讀取失敗：在檔案 '{file_path_hint}' 的第 {line_number} 行沒有找到任何對應的函數或類別邊界。請退回使用 read_code_snippet 工具讀取該行附近的程式碼。"
+
+        # 5. 根據邊界擷取真實程式碼
+        try:
+            with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+                
+            start_line = matched_bounds["start_line"]
+            end_line = matched_bounds["end_line"]
+            
+            # 加上防呆，確保行號沒有超過檔案總行數
+            start_idx = max(0, start_line - 1)
+            end_idx = min(len(lines), end_line)
+            
+            snippet = "".join(lines[start_idx:end_idx])
+            
+            return (
+                f"🎯 成功於第 {line_number} 行定位到 【{matched_symbol_type}:】\n"
+                f"以下為完整的落點區塊 (行號 {start_line}-{end_line}):\n\n"
+                f"{snippet}"
+            )
+            
+        except Exception as e:
+            return f"讀取檔案失敗: {e}"
+
+    @tool
     def analyze_class_architecture(class_name: str) -> str:
         """
         當你需要知道某個 Class 的父類別是誰、被哪些子類別實作，或是包含哪些「成員變數」時使用。
@@ -368,5 +451,6 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             get_git_blame,
             exact_keyword_search,
             read_symbol_code,
+            read_function_by_line,
             analyze_class_architecture,
             find_symbol_references]
