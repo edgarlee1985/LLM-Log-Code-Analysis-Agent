@@ -388,12 +388,21 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         
         # 讀取剛剛在 Indexer 階段建立的字典
         ref_path = os.path.join(db_dir, "symbol_references.json")
+        bounds_path = os.path.join(db_dir, "symbol_bounds.json")
+        
         if not os.path.exists(ref_path):
             return "系統錯誤：Symbol Reference 字典不存在。請確認是否已成功建構索引。"
             
         try:
             with open(ref_path, "r", encoding="utf-8") as f:
                 ref_data = json.load(f)
+                
+            # 同時讀取 AST 邊界字典，用於獲取 Function / Class 的上下文範圍
+            bounds_data = {}
+            if os.path.exists(bounds_path):
+                with open(bounds_path, "r", encoding="utf-8") as f:
+                    bounds_data = json.load(f)
+                    
         except Exception as e:
             return f"讀取字典檔案失敗: {e}"
             
@@ -422,25 +431,79 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             
             report.append(f"📄 檔案: {file_path}")
             
-            # 嘗試讀取真實檔案內容，擷取該行的程式碼
+            # 1. 取得實際檔案路徑與 AST 邊界實體
             actual_path = resolve_best_repo_path(file_path, repo_dir)
+            target_entities = None
+            
+            # 優先嘗試實際比對路徑
+            if actual_path:
+                for dict_file_path, entities in bounds_data.items():
+                    if os.path.normpath(dict_file_path) == os.path.normpath(actual_path):
+                        target_entities = entities
+                        break
+            
+            # 若 actual_path 對不到，退回使用字典內記載的原 file_path
+            if not target_entities:
+                for dict_file_path, entities in bounds_data.items():
+                    if os.path.normpath(dict_file_path) == os.path.normpath(file_path):
+                        target_entities = entities
+                        break
+
+            # 2. 嘗試讀取檔案真實內容，擷取該行的程式碼
+            all_lines = []
             if actual_path and os.path.exists(actual_path):
                 try:
                     with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
                         all_lines = f.readlines()
-                        for line_num in lines:
-                            # 確保行號在合理範圍內
-                            if 0 < line_num <= len(all_lines):
-                                code_line = all_lines[line_num - 1].strip()
-                                report.append(f"  - [行 {line_num}] {code_line}")
                 except Exception:
-                    # 若檔案讀取失敗，退回只顯示行號
-                    line_str = ", ".join(map(str, lines))
-                    report.append(f"  - (行號: {line_str})")
-            else:
-                 line_str = ", ".join(map(str, lines))
-                 report.append(f"  - (行號: {line_str})")
-
+                    pass
+            
+            # 3. 將行號按 Function / Class 範圍進行分組 (Scope Grouping)
+            scope_groups = {} 
+            
+            for line_num in lines:
+                matched_symbol_type = None
+                matched_signature = None
+                matched_bounds = None
+                
+                if target_entities:
+                    # 優先找函數 (取範圍最小的)
+                    for func_name, bounds in target_entities.get("functions", {}).items():
+                        if bounds["start_line"] <= line_num <= bounds["end_line"]:
+                            if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
+                                matched_symbol_type = "Function"
+                                # 這裡使用建構索引時儲存的 signature
+                                matched_signature = bounds.get("signature", func_name) 
+                                matched_bounds = bounds
+                                
+                    # 如果沒找到函數，其次找類別
+                    if not matched_bounds:
+                        for cls_name, bounds in target_entities.get("classes", {}).items():
+                            if bounds["start_line"] <= line_num <= bounds["end_line"]:
+                                if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
+                                    matched_symbol_type = "Class"
+                                    matched_signature = cls_name
+                                    matched_bounds = bounds
+                
+                # 若都不符合，則歸類為 Global 範圍
+                scope_key = f"{matched_symbol_type}, {matched_signature}" if matched_symbol_type else "Global"
+                
+                if scope_key not in scope_groups:
+                    scope_groups[scope_key] = []
+                scope_groups[scope_key].append(line_num)
+                
+            # 4. 排版輸出
+            for scope_key, scope_lines in scope_groups.items():
+                if scope_key != "Global":
+                    report.append(f"  - {scope_key}")
+                    
+                for line_num in scope_lines:
+                    if all_lines and 0 < line_num <= len(all_lines):
+                        code_line = all_lines[line_num - 1].strip()
+                        report.append(f"  - [行 {line_num}] {code_line}")
+                    else:
+                        report.append(f"  - [行 {line_num}] (無法讀取程式碼)")
+                        
             file_count += 1
             
         return "\n".join(report)
