@@ -195,9 +195,6 @@ engineer_human_prompt = """
 【Bug 重現步驟】
 {steps}
 
-【系統 Log 原始紀錄】
-{logs}
-
 【歷史調查紀錄 (Investigation History)】
 {investigation_history}
 
@@ -327,7 +324,6 @@ def build_debugging_graph(llm, tools):
         evaluation = {}
         llm_input = {
             "steps": state["steps"],
-            "logs": state["logs"],
             "investigation_history": history_text,
         }
         try:
