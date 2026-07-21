@@ -69,7 +69,8 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def read_code_snippet(file_path_hint: str, start_line: int, end_line: int) -> str:
         """
-        當已知檔案名稱與行號，但不確定與哪些函數、變數有關時使用，讀取指定範圍的程式碼查找線索。
+        【使用時機】當已知檔案名稱與行號，但不確定與哪些函數、變數有關時使用。
+        【警告】若你已經知道要找的變數或函數名稱，請改用 read_symbol_code，不要用此工具讀取大片無關程式碼浪費資源。
         注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
         """
         print(f"read_code_snippet, file_path_hint = {file_path_hint}, start_line = {start_line}, end_line = {end_line}")
@@ -169,7 +170,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def read_symbol_code(file_path_hint: str, target_symbol: str) -> str:
         """
-        【使用時機】當你「已經精確掌握某個變數、類別或函數名稱」，且需要知道它在哪裡被呼叫或實作時使用。
+        【使用時機】當你已經精確掌握某個「變數、類別或函數名稱」，且需要知道它的內部實作或定義時使用。這是最精準獲取邏輯的方式，一旦知道變數名稱應優先使用此工具。
         【限制】絕對不能傳入一段 Log 句子或口語文字。只能傳入精確的程式碼符號 (如 'calculate_total')。
         注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
         """
