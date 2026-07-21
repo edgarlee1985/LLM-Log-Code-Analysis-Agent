@@ -1,5 +1,6 @@
 import os
 import configparser
+import time
 from typing import List, Dict, Optional
 from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field
@@ -512,6 +513,7 @@ if __name__ == "__main__":
     repo_dir = config["Default"]["RepoDir"]
     db_dir = config["Default"]["FAISSDBDir"]
 
+    start_total_time = time.perf_counter() # 記錄開始時間
     
     # 建立統計實例
     token_tracker = TokenTrackerCallback()
@@ -530,6 +532,7 @@ if __name__ == "__main__":
     debugger_app = build_debugging_graph(llm, tools)
 
     for report in bug_reports:
+        bug_start_time = time.perf_counter() # 記錄 bug 開始時間
         token_tracker.reset_current()
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
@@ -559,6 +562,10 @@ if __name__ == "__main__":
         print("\n🏆 --- 最終 Bug 報告 --- 🏆")
         print(final_state.get("final_report", "無法在迭代次數內找到完整的 Root Cause。以下是目前分析：\n" + final_state.get("missing_information", "")))
         
+        bug_end_time = time.perf_counter() # 記錄 bug 結束時間
+        bug_total_time = bug_end_time - bug_start_time
+        print("--- {report.bug_id} 花費時間 ---")
+        print(f"\nbug 執行時間：{bug_total_time:.4f} 秒")
         # 迴圈尾聲：印出【單次 Bug】的消耗
         print(f"\n📊 --- {report.bug_id} Token 消耗 --- 📊")
         print(f"輸入量 : {token_tracker.current_prompt_tokens}")
@@ -571,6 +578,10 @@ if __name__ == "__main__":
         #print("\n--- 最終 Bug 報告 ---")
         #print(final_report)
         
+    end_total_time = time.perf_counter() # 記錄結束時間
+    total_time = end_total_time - start_total_time
+    print("--- 花費時間統計 ---")
+    print(f"\n總執行時間：{total_time:.4f} 秒")
     # 當所有 Bug 都處理完畢跳出迴圈後，印出【全局總累計】
     print("\n🌍 --- 全局總 Token 消耗統計 --- 🌍")
     print(f"總輸入量 : {token_tracker.all_prompt_tokens}")
