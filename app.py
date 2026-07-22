@@ -170,8 +170,9 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
    - [精準打擊]：一旦從 Log 或初步探索中「明確得知目標變數、函數或類別名稱」，請立即切換策略！優先使用 `read_symbol_code` 提取該符號的完整實作，或使用 `find_symbol_references` 追蹤引用，嚴禁繼續用 read_code_snippet 盲目讀取大量無關程式碼。
 2. 減少上下文碎片化：
    - 盡量在一次指令中要求獲取完整的執行路徑，避免「查 A 函數 -> 發現裡面有 B 變數 -> 再下指令查 B 變數」的低效行為。
-3. 失敗快速回退 (Fail-Fast & Backtrack)：
-   - 檢視「歷史調查紀錄」時，若發現連續兩次相同的檢索方向都【查無資料】或【無法定位】，請立刻放棄該方向。重新檢視原始 Log，切換另一種調查策略。
+3. 避免重複與指令推進 (Push Forward)：
+   - 如果探員上一輪已經回報某個方向失敗 (例如 Device 找不到 hardwareMode)，你的下一輪指令【絕對不可以】再叫探員去查一樣的地方或退回起點！
+   - 你必須推進邏輯：指派探員使用 `analyze_class_architecture` 工具找出父類別。指令必須越來越微觀。
 
 【💡 工作模式：假設驅動 (Hypothesis-Driven)】
 你必須嚴格遵循以下思考循環：
@@ -406,7 +407,15 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
         
         # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
         agent = create_tool_calling_agent(detective_llm, tools, detective_prompt)
-        agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
+    
+        # 加上 return_intermediate_steps=True
+        agent_runner = AgentExecutor(
+            agent=agent, 
+            tools=tools, 
+            verbose=True, 
+            max_iterations=5,
+            return_intermediate_steps=True  # 保留中間的工具呼叫軌跡
+        )
         
         # 執行檢索
         result = agent_runner.invoke({
@@ -415,11 +424,22 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
             "logs": state["logs"]
         })
         
-        # 建立這次調查的結構化報告字串，並打包進陣列
+        # 提取並格式化中間過程 (Scratchpad)
+        steps_info = ""
+        if "intermediate_steps" in result:
+            for action, observation in result["intermediate_steps"]:
+                steps_info += f"🛠️ 使用工具: {action.tool} | 參數: {action.tool_input}\n"
+                obs_str = str(observation)
+                if len(obs_str) > 1000:
+                    obs_str = obs_str[:1000] + "\n... (輸出過長已截斷)"
+                steps_info += f"👀 觀察結果:\n{obs_str}\n\n"
+        
+        # 將過程紀錄合併進回報中
         new_report = (
             f"=== 第 {state['iterations']} 次調查 ===\n"
             f"📥 收到指令:\n{search_query}\n"
-            f"📤 調查結果:\n{result['output']}\n"
+            f"📤 調查過程:\n{steps_info}\n"
+            f"📤 最終結論:\n{result.get('output', '無結論')}\n"
         )
         
         return {
