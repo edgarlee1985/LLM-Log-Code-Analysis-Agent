@@ -296,7 +296,7 @@ def parse_report(llm, bug_report: SingleBugReport) -> LogClues:
 # ==========================================
 # LangGraph Workflow 建立 (使用閉包封裝 LLM 與 Tools)
 # ==========================================
-def build_debugging_graph(llm, tools):
+def build_debugging_graph(engineer_llm, detective_llm, tools):
     # ==========================================
     # 核心節點 (Nodes)
     # ==========================================
@@ -314,7 +314,7 @@ def build_debugging_graph(llm, tools):
             ("human", engineer_human_prompt)
         ])
 
-        structured_llm = llm.with_structured_output(EngineerEvaluation)
+        structured_llm = engineer_llm.with_structured_output(EngineerEvaluation)
 
         # 建立管線
         analysis_chain = (
@@ -393,7 +393,7 @@ def build_debugging_graph(llm, tools):
         ])
         
         # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
-        agent = create_tool_calling_agent(llm, tools, detective_prompt)
+        agent = create_tool_calling_agent(detective_llm, tools, detective_prompt)
         agent_runner = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
         
         # 執行檢索
@@ -517,26 +517,37 @@ if __name__ == "__main__":
     
     # 建立統計實例
     token_tracker = TokenTrackerCallback()
-    llm = ChatOllama(model=config["Default"]["ModelName"],
-                     temperature=0.0,
-                     seed=50, repeat_penalty=1.2,
-                     num_ctx=16384,
-                     num_predict=4096,
-                     format="json",
-                     callbacks=[token_tracker])
+
+    llm_json = ChatOllama(model=config["Default"]["ModelName"],
+                        temperature=0.0,
+                        seed=50, repeat_penalty=1.2,
+                        num_ctx=16384,
+                        num_predict=4096,
+                        format="json", 
+                        callbacks=[token_tracker]
+                        )
+
+    llm_text = ChatOllama(model=config["Default"]["ModelName"],
+                        temperature=0.0,
+                        seed=50, repeat_penalty=1.2,
+                        num_ctx=16384,
+                        num_predict=4096,
+                        # 不加 format="json"
+                        callbacks=[token_tracker]
+                        )
     
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
     ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
     tools = create_agent_tools(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
     # 建立 Graph
-    debugger_app = build_debugging_graph(llm, tools)
+    debugger_app = build_debugging_graph(llm_json, llm_text, tools)
 
     for report in bug_reports:
         bug_start_time = time.perf_counter() # 記錄 bug 開始時間
         token_tracker.reset_current()
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
-        clues = parse_report(llm, report)
+        clues = parse_report(llm_json, report)
         print(f"萃取線索: {clues}\n")
         
         # 初始化 State
