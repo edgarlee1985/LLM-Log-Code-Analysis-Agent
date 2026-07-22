@@ -11,14 +11,18 @@ from pathlib import Path
 import operator
 
 # 現代 LangChain 工具與 LCEL
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_ollama import ChatOllama
-from langgraph.graph import StateGraph, END
 from langchain_ollama import OllamaEmbeddings
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.errors import GraphRecursionError
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -309,7 +313,69 @@ def parse_report(llm, bug_report: SingleBugReport) -> LogClues:
 # ==========================================
 # LangGraph Workflow 建立 (使用閉包封裝 LLM 與 Tools)
 # ==========================================
+
+# 定義 Detective 專用的子狀態，負責存放工具呼叫的對話歷史
+class DetectiveState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+def build_detective_subgraph(detective_llm, tools):
+    """建立純 LCEL 與 ToolNode 的檢索子圖"""
+    
+    # 定義 LLM 推論節點
+    def detective_model_node(state: DetectiveState):
+        messages = state["messages"]
+        processed_messages = []
+        
+        # 統一使用合理的 Context Window 限制
+        for i, msg in enumerate(messages):
+            if i < 2: # 保留 System 與 Human Prompt
+                processed_messages.append(msg)
+                continue
+                
+            if isinstance(msg, ToolMessage):
+                content_str = str(msg.content)
+                # 給予統一且充足的長度 (如 8000)，不要任意把過去的工具結果折疊成 200 字元
+                if len(content_str) > 8000:
+                    short_content = content_str[:8000] + "\n\n...(⚠️ 程式碼過長已截斷，請指示更精確的行號或縮小範圍)..."
+                    processed_messages.append(ToolMessage(content=short_content, tool_call_id=msg.tool_call_id, name=msg.name))
+                else:
+                    processed_messages.append(msg)
+            else:
+                # 其他訊息 (例如 AIMessage) 原樣保留
+                processed_messages.append(msg)
+                
+        # 將「修剪過」的訊息陣列交給 LLM 推論
+        response = detective_llm.bind_tools(tools).invoke(processed_messages)
+        
+        return {"messages": [response]}
+        
+    # 定義工具執行節點 (使用 LangGraph 原生的 ToolNode)
+    tool_node = ToolNode(tools)
+    
+    # 建立子圖
+    workflow = StateGraph(DetectiveState)
+    workflow.add_node("detective_model", detective_model_node)
+    workflow.add_node("detective_tools", tool_node)
+    
+    workflow.add_edge(START, "detective_model")
+    
+    # 內建的 tools_condition 會自動檢查 LLM 的回應是否有 tool_calls
+    # 有則導向 tools，沒有則導向 END
+    workflow.add_conditional_edges(
+        "detective_model",
+        tools_condition,
+        {"tools": "detective_tools", END: END}
+    )
+    # 工具執行完後，強制作為上下文傳回給 LLM 繼續推論
+    workflow.add_edge("detective_tools", "detective_model")
+    
+    return workflow.compile()
+
 def build_debugging_graph(engineer_llm, detective_llm, tools):
+    
+    # --- [新增] 初始化 Detective 子圖 ---
+    detective_subgraph = build_detective_subgraph(detective_llm, tools)
+
     # ==========================================
     # 核心節點 (Nodes)
     # ==========================================
@@ -383,7 +449,7 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
     def detective_node(state: GraphState):
         print(f"\n[Detective Node] 啟動 (第 {state['iterations']} 次迭代)")
         
-        # 從 Engineer 的需求單中提取資訊，如果沒有就使用最初的 log clues
+        # 準備 Search Query 
         if state.get("current_request"):
             req = state["current_request"]
             search_query = (
@@ -398,52 +464,102 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
                 f"【指令】：請只挑選「最可能發生問題的 1 個檔案或 1 個函數」進行檢索。不要一次查詢多個目標！"
             )
         
-        # 給探員的專屬 Prompt (補齊了 steps 和 logs，讓它有全局 Context)
-        detective_prompt = ChatPromptTemplate.from_messages([
-            ("system", detective_system_prompt),
-            ("human", "【情報需求單】\n{query}\n\n【原始 Bug 步驟】\n{steps}\n\n【原始 Log】\n{logs}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ])
+        # 將 Prompt 轉換為標準的 Message 陣列
+        system_msg = SystemMessage(content=detective_system_prompt)
+        human_msg = HumanMessage(content=f"【情報需求單】\n{search_query}\n\n【原始 Bug 步驟】\n{state['steps']}\n\n【原始 Log】\n{state['logs']}")
         
-        # 建立 Tool Agent (請確保 global 變數 llm 和 tools 有正確定義)
-        agent = create_tool_calling_agent(detective_llm, tools, detective_prompt)
-    
-        # 加上 return_intermediate_steps=True
-        agent_runner = AgentExecutor(
-            agent=agent, 
-            tools=tools, 
-            verbose=True, 
-            max_iterations=5,
-            return_intermediate_steps=True  # 保留中間的工具呼叫軌跡
-        )
+        # 呼叫 Sub-Graph，取代 AgentExecutor
+        recursion_limit = 20
+        try:
+            # 準備初始輸入狀態與一個變數來保存完整對話歷史
+            input_state = {"messages": [system_msg, human_msg]}
+            all_messages = list(input_state["messages"])
+            
+            # 新增字典用來暫存 tool_calls
+            pending_tool_calls = {}
+            
+            for event in detective_subgraph.stream(
+                input_state,
+                config={"recursion_limit": recursion_limit}, # 👈 節點跳轉限制
+                stream_mode="updates"                        # 👈 每次有節點更新時回傳狀態
+            ):
+                for node_name, state_update in event.items():
+                    # 取出該節點產生的新訊息
+                    new_messages = state_update.get("messages", [])
+                    
+                    for msg in new_messages:
+                        all_messages.append(msg) # 將新訊息加入歷史紀錄以便後續流程使用
+                        
+                        # 處理 LLM 發出的訊息
+                        if isinstance(msg, AIMessage):
+                            if msg.content:
+                                print(f"\n🤔 [Agent 思考]:\n{msg.content}")
+                            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                                # 🔥 將工具呼叫存入字典，Key 為 id，先不印出
+                                for tc in msg.tool_calls:
+                                    pending_tool_calls[tc['id']] = tc
+                                    
+                        # 處理工具回傳的結果
+                        elif isinstance(msg, ToolMessage):
+                            # 從暫存區抓出對應的呼叫紀錄
+                            tc = pending_tool_calls.get(msg.tool_call_id)
+                            if tc:
+                                print(f"\n🛠️ [呼叫工具]: {tc['name']} | 參數: {tc['args']}")
+
+                            print(f"👀 [工具結果]:\n{msg.content}")
+
+            final_sub_state = {"messages": all_messages}
+            
+        except GraphRecursionError:
+            print(f"⚠️ [警告] Detective 子圖觸發了 recursion_limit = {recursion_limit}，強制中斷！")
+            # 建立一個模擬的強制中斷狀態，假裝這是 LLM 的最終回答
+            fallback_message = AIMessage(content="【探員回報】工具呼叫陷入無限迴圈或超過次數上限，我無法得出最終結論。請提供更明確的指令或更改檢索策略。")
+            # 將 fallback 訊息加進 all_messages，保留歷史紀錄
+            all_messages.append(fallback_message)
+            final_sub_state = {"messages": all_messages}
+            
+        except Exception as e:
+            print(f"⚠️ [警告] Detective 子圖發生未知錯誤: {e}")
+            fallback_message = AIMessage(content=f"【探員回報】執行過程中發生嚴重系統錯誤: {e}")
+            final_sub_state = {"messages": [system_msg, human_msg, fallback_message]}
         
-        # 執行檢索
-        result = agent_runner.invoke({
-            "query": search_query,
-            "steps": state["steps"],
-            "logs": state["logs"]
-        })
-        
-        # 提取並格式化中間過程 (Scratchpad)
+        # 手動萃取與格式化對話軌跡
         steps_info = ""
-        if "intermediate_steps" in result:
-            for action, observation in result["intermediate_steps"]:
-                steps_info += f"🛠️ 使用工具: {action.tool} | 參數: {action.tool_input}\n"
-                obs_str = str(observation)
-                if len(obs_str) > 1000:
-                    obs_str = obs_str[:1000] + "\n... (輸出過長已截斷)"
+        final_output = "無結論"
+        
+        # 組裝歷史訊息給 Engineer 時，也要成對組裝
+        history_tool_calls = {}
+        
+        for msg in final_sub_state["messages"]:
+            if isinstance(msg, AIMessage):
+                if not getattr(msg, 'tool_calls', None):
+                    final_output = str(msg.content)
+                elif getattr(msg, 'tool_calls', None):
+                    for tc in msg.tool_calls:
+                        history_tool_calls[tc['id']] = tc
+            
+            # 如果是工具回傳的結果 【修正在這裡：將給 Engineer 看的內容截斷為 500 字元】
+            elif isinstance(msg, ToolMessage):
+                # 先貼上工具呼叫資訊
+                tc = history_tool_calls.get(msg.tool_call_id)
+                if tc:
+                    steps_info += f"🛠️ 使用工具: {tc['name']} | 參數: {tc['args']}\n"
+                
+                # 再貼上回傳結果
+                obs_str = str(msg.content)
+                if len(obs_str) > 500:
+                    obs_str = obs_str[:500] + "\n... (探員已讀取此片段，詳細內容已折疊以節省 Token)"
                 steps_info += f"👀 觀察結果:\n{obs_str}\n\n"
         
-        # 將過程紀錄合併進回報中
+        # 組裝回原本格式
         new_report = (
             f"=== 第 {state['iterations']} 次調查 ===\n"
             f"📥 收到指令:\n{search_query}\n"
-            f"📤 調查過程:\n{steps_info}\n"
-            f"📤 最終結論:\n{result.get('output', '無結論')}\n"
+            f"📤 最終結論:\n{final_output}\n"
         )
         
         return {
-            "investigation_history": [new_report], # 使用 operator.add 會自動把這個陣列接在舊紀錄後面
+            "investigation_history": [new_report],
             "iterations": state["iterations"] + 1
         }
 
