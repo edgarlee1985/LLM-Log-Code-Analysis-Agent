@@ -63,9 +63,11 @@ class LogClues(BaseModel):
 class DetectiveCommand(BaseModel):
     """工程師開給探員的情報需求單"""
     hypothesis: str = Field(default="", description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
-    action_type: str = Field(default="", description="要執行的檢索類型：READ_FILE, SEMANTIC_SEARCH, EXACT_KEYWORD 等")
-    target_value: str = Field(default="", description="對應的關鍵字、檔案路徑或語意描述")
-    focus_point: str = Field(default="", description="請探員特別注意什麼？例如：'請幫我確認這個 class 有沒有繼承 BaseUser'")
+    # 🔴 允許工程師直接下令使用特定工具
+    action_type: str = Field(default="", description="要執行的檢索動作，請直接填寫強烈建議探員使用的「工具名稱」，例如：read_symbol_code, analyze_class_architecture, semantic_code_search")
+    target_value: str = Field(default="", description="對應的關鍵字、檔案路徑、類別名稱 (如 JetsonOrinDeployer) 或語意描述")
+    # 🔴 提示工程師可以下達關於繼承的指令
+    focus_point: str = Field(default="", description="請探員特別注意什麼？例如：'請幫我找出這個 class 繼承了哪個父類別'、'檢查是否有 override'")
 
 class EngineerEvaluation(BaseModel):
     """工程師的深度分析與決策報告"""
@@ -175,6 +177,11 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 3. 避免重複與指令推進 (Push Forward)：
    - 如果探員上一輪已經回報某個方向失敗 (例如 Device 找不到 hardwareMode)，你的下一輪指令【絕對不可以】再叫探員去查一樣的地方或退回起點！
    - 你必須推進邏輯：指派探員使用 `analyze_class_architecture` 工具找出父類別。指令必須越來越微觀。
+
+4. 物件導向 (OOP) 與多型陷阱 (Polymorphism) 專屬守則：
+   - [調查族譜]：當你發現目標與「類別 (Class)」或「物件」有關時，必須優先指派探員使用 `analyze_class_architecture` 了解該類別的繼承關係 (Base Classes)。
+   - [父類別回溯]：如果子類別中找不到目標變數或函數，它極有可能定義在「父類別」中。請立刻要求探員去讀取父類別的實作。
+   - [建構子陷阱]：在 C++ 中，在建構子 (Constructor) 內部呼叫虛擬函數 (Virtual Function) 時，不會觸發多型！它只會執行當前類別（或父類別）的實作，不會執行子類別的 Override。請特別留意 Log 是否從建構子發出。
 
 【💡 工作模式：假設驅動 (Hypothesis-Driven)】
 你必須嚴格遵循以下思考循環：

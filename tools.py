@@ -55,7 +55,18 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
 
     @tool
     def semantic_code_search(query: str) -> str:
-        """當不知道具體檔名，但知道邏輯異常時使用。根據語意搜尋 Codebase。"""
+        """
+        【功能】根據語意搜尋 Codebase。
+        
+        【使用時機】
+        - 當不知道具體檔名，但知道邏輯異常時使用。
+        
+        【禁用時機 (絕對不要用)】
+        - 無特別註明。
+        
+        【輸入規範】
+        - query 為描述邏輯異常的查詢字串。
+        """
         docs = ensemble_retriever.invoke(query)
         result = []
         for d in docs:
@@ -69,9 +80,16 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def read_code_snippet(file_path_hint: str, start_line: int, end_line: int) -> str:
         """
-        【使用時機】當已知檔案名稱與行號，但不確定與哪些函數、變數有關時使用。
-        【警告】若你已經知道要找的變數或函數名稱，請改用 read_symbol_code，不要用此工具讀取大片無關程式碼浪費資源。
-        注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
+        【功能】讀取指定檔案與行號範圍內的程式碼片段。
+        
+        【使用時機】
+        - 當已知檔案名稱與行號，但不確定與哪些函數、變數有關時使用。
+        
+        【禁用時機 (絕對不要用)】
+        - ❌ 若你已經知道要找的變數或函數名稱，請改用 `read_symbol_code`，不要用此工具讀取大片無關程式碼浪費資源。
+        
+        【輸入規範】
+        - file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
         """
         print(f"read_code_snippet, file_path_hint = {file_path_hint}, start_line = {start_line}, end_line = {end_line}")
 
@@ -90,8 +108,17 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def get_git_blame(file_path_hint: str, line_number: int) -> str:
         """
-        查詢某行程式碼的 Git Blame，了解是誰在什麼時候修改了這行邏輯
-        注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
+        【功能】查詢某行程式碼的 Git Blame，了解是誰在什麼時候修改了這行邏輯。
+        
+        【使用時機】
+        - 當需要查詢特定檔案具體行號的 Git 歷史修改紀錄時使用。
+        
+        【禁用時機 (絕對不要用)】
+        - 無特別註明。
+        
+        【輸入規範】
+        - file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
+        - 傳入的 line_number 必須確認沒有超過檔案總行數。
         """
     
         print(f"get_git_blame, file_path_hint = {file_path_hint}, line_number = {line_number}")
@@ -138,9 +165,18 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def exact_keyword_search(keyword: str, file_extension: str = "") -> str:
         """
-        【使用時機】當你只有「非結構化文字」時使用，例如 Log 錯誤訊息 (如 'Database connection timeout')，或是寫死的字串。
-        【限制】不要用這個工具來追蹤變數的 Call Stack，這會產生大量雜訊。如果要追蹤變數引用，請改用 find_symbol_references。
-        可以選擇性提供副檔名過濾 (例如: '.cpp' 或 '.py')。
+        【功能】利用 git grep 在 Codebase 中精確搜尋特定字串。
+        
+        【使用時機】
+        - 當你只有「非結構化文字」時使用，例如 Log 錯誤訊息 (如 'Database connection timeout')，或是寫死的字串。
+        
+        【禁用時機 (絕對不要用)】
+        - ❌ 不要用這個工具來追蹤變數的 Call Stack，這會產生大量雜訊。
+        - ❌ 如果要追蹤變數引用，請改用 `find_symbol_references`。
+        
+        【輸入規範】
+        - keyword 必須是精確的子字串，不要傳入 Regular Expression。
+        - 可以選擇性提供 file_extension 副檔名過濾 (例如: '.cpp' 或 '.py')。
         """
         print(f"exact_keyword_search, keyword = {keyword}, file_extension = {file_extension}")
 
@@ -170,9 +206,21 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def read_symbol_code(file_path_hint: str, target_symbol: str) -> str:
         """
-        【使用時機】當你已經精確掌握某個「變數、類別或函數名稱」，且需要知道它的內部實作或定義時使用。這是最精準獲取邏輯的方式，一旦知道變數名稱應優先使用此工具。
-        【限制】絕對不能傳入一段 Log 句子或口語文字。只能傳入精確的程式碼符號 (如 'calculate_total')。
-        注意：file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
+        【功能】閱讀特定「類別 (Class)」或「函數/方法 (Function/Method)」的完整內部實作程式碼。
+        
+        【使用時機】
+        - 當你已經精確掌握某個「類別 (Class)」或「函數/方法 (Function/Method)」的名稱，且需要閱讀其完整的內部實作程式碼時使用。
+        - 如果在指定的 Class 檔案中找不到該 target_symbol (例如方法不存在)，通常是因為方法是繼承來的，此時請改用 `analyze_class_architecture` 查詢該 Class 的父類別。
+        
+        【禁用時機 (絕對不要用)】
+        - ❌ 本工具無法搜尋「變數 (Variable)」。
+        - ❌ 若要尋找成員變數的定義，請改用 `analyze_class_architecture` 或是 `exact_keyword_search`。
+        - ❌ 若要追蹤變數在哪裡被呼叫或修改，請改用 `find_symbol_references`。
+        - ❌ 絕對不能傳入一段 Log 句子或口語文字。
+        
+        【輸入規範】
+        - file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
+        - target_symbol 必須是精確的類別或函數名稱。
         """
         print(f"read_symbol_code, file_path_hint = {file_path_hint}, target_symbol = {target_symbol}")
         
@@ -236,9 +284,17 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def read_function_by_line(file_path_hint: str, line_number: int) -> str:
         """
-        【使用時機】當你從 Log 得知錯誤發生的「檔案名稱與具體行號」，想直接獲取包含該落點的「完整函數或類別程式碼」時使用。
-        【優勢】比 read_code_snippet 更精準，能自動透過 AST 分析切出完整的函數範圍，避免程式碼被截斷。
-        注意：file_path_hint 必須是絕對路徑或相對路徑，系統會自動進行智慧比對。
+        【功能】自動透過 AST 分析切出完整的函數或類別範圍，並回傳該落點的完整程式碼。
+        
+        【使用時機】
+        - 當你從 Log 得知錯誤發生的「檔案名稱與具體行號」，想直接獲取包含該落點的「完整函數或類別程式碼」時使用。
+        - 此工具比 `read_code_snippet` 更精準，可避免程式碼被截斷。
+        
+        【禁用時機 (絕對不要用)】
+        - ❌ 若系統回報在 AST 字典中沒有解析紀錄，或沒有找到對應的邊界，無法精準切出函數時，請退回使用 `read_code_snippet` 工具。
+        
+        【輸入規範】
+        - file_path_hint 必須是絕對路徑或相對路徑，系統會自動進行智慧比對。
         """
         print(f"read_function_by_line, file_path_hint = {file_path_hint}, line_number = {line_number}")
         
@@ -308,7 +364,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             snippet = "".join(lines[start_idx:end_idx])
             
             return (
-                f"🎯 成功於第 {line_number} 行定位到 【{matched_symbol_type}:】\n"
+                f"🎯 成功於第 {line_number} 行定位到 【{matched_symbol_type}】\n"
                 f"以下為完整的落點區塊 (行號 {start_line}-{end_line}):\n\n"
                 f"{snippet}"
             )
@@ -319,8 +375,17 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def analyze_class_architecture(class_name: str) -> str:
         """
-        當你需要知道某個 Class 的父類別是誰、被哪些子類別實作，或是包含哪些「成員變數」時使用。
-        輸入 Class 名稱，回傳該類別的完整架構（繼承關係、實作類別、成員變數清單）。
+        【功能】回傳該類別的完整架構（包含所在檔案、繼承關係、實作類別、成員變數清單與類別方法）。
+        
+        【使用時機】
+        - 當你需要知道某個 Class 的父類別是誰、被哪些子類別實作，或是包含哪些「成員變數」時使用。
+        - 如果你在追蹤某個類別的方法卻找不到時，請立刻對該類別使用此工具，查看它的「繼承自 (Base Classes)」，然後去父類別尋找該方法。
+        
+        【禁用時機 (絕對不要用)】
+        - 無特別註明。
+        
+        【輸入規範】
+        - class_name 必須輸入目標 Class 的名稱。
         """
         # 確保這裡的路徑與你存檔的路徑一致
         tree_path = os.path.join(db_dir, "class_dependency_tree.json") 
@@ -401,9 +466,17 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     @tool
     def find_symbol_references(symbol_name: str) -> str:
         """
-        當你需要知道某個「變數、函數或類別」在哪些檔案的哪些行數被「呼叫」或「使用」時使用。
-        這有助於追蹤變數的修改來源，或是函數的呼叫鏈 (Call Stack)。
-        請傳入精確的符號名稱 (例如: 'calculate_total' 或 'user_id')。
+        【功能】追蹤某個「變數、函數或類別」在哪些檔案的哪些行數被「呼叫」或「使用」。
+        
+        【使用時機】
+        - 當你需要知道某個「變數、函數或類別」在哪些檔案的哪些行數被使用時。
+        - 有助於追蹤變數的修改來源，或是函數的呼叫鏈 (Call Stack)。
+        
+        【禁用時機 (絕對不要用)】
+        - 無特別註明。
+        
+        【輸入規範】
+        - 請傳入精確的符號名稱 (例如: 'calculate_total' 或 'user_id')。
         """
         print(f"find_symbol_references, symbol_name = {symbol_name}")
         
