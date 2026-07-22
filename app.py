@@ -83,9 +83,7 @@ class GraphState(TypedDict):
     steps: str
     logs: str
     log_clues: str
-    
-    # 使用 operator.add 讓每次的調查紀錄自動附加，形成對話歷史
-    investigation_history: Annotated[List[str], operator.add] 
+    investigation_history: List[str]
     
     # 存放 Engineer 開出的具體指令 (DetectiveCommand 的 dict 格式)
     current_request: Optional[dict] 
@@ -558,8 +556,14 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
             f"📤 最終結論:\n{final_output}\n"
         )
         
+        # 將最新的報告加入歷史紀錄，並強制只保留最近 3 筆，防止 Context Window 爆掉
+        current_history = state.get("investigation_history", [])
+        current_history.append(new_report)
+        if len(current_history) > 3:
+            current_history = current_history[-3:]
+
         return {
-            "investigation_history": [new_report],
+            "investigation_history": current_history, # 覆蓋原本的 Append 行為
             "iterations": state["iterations"] + 1
         }
 
