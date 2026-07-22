@@ -4,6 +4,49 @@ from pathlib import Path
 import json
 from langchain_core.tools import tool
 
+def resolve_best_repo_path(log_path_hint: str, target_repo_dir: str, ignore_dirs: set[str]) -> str:
+    """根據 Log 提供的路徑，利用最長共同目錄比對 (Longest Common Suffix) 找出真實的 Repo 路徑"""
+    if not log_path_hint:
+        return ""
+    # 將 Log 路徑統一為 POSIX 格式以便切割
+    log_parts = Path(log_path_hint.replace("\\", "/")).parts
+    target_filename = log_parts[-1] # 取得最右邊的純檔名
+    
+    candidates = []
+    # 掃描 Repo 找出所有「檔名完全相同」的檔案
+    for root, dirs, files in os.walk(target_repo_dir):
+        dirs[:] = [d for d in dirs if d not in ignore_dirs] # 濾除不需要掃描的資料夾
+        if target_filename in files:
+            candidates.append(os.path.join(root, target_filename))
+            
+    if not candidates:
+        return ""
+        
+    # 如果只有一個，就直接回傳，省下比對時間
+    if len(candidates) == 1:
+        return candidates[0]
+                
+    # 如果有多個同名檔案，進行從右到左的資料夾比對
+    best_match = ""
+    max_score = -1
+    
+    for cand_path in candidates:
+        cand_parts = Path(cand_path).parts
+        
+        # 從右往左 (reversed) 逐層比對：檔名 -> 父資料夾 -> 祖父資料夾...
+        score = 0
+        for log_p, cand_p in zip(reversed(log_parts), reversed(cand_parts)):
+            if log_p.lower() == cand_p.lower():
+                score += 1
+            else:
+                break # 一旦遇到不同的資料夾名稱就停止計分
+                
+        if score > max_score:
+            max_score = score
+            best_match = cand_path
+            
+    return best_match
+
 # 定義給 Agent 使用的工具 (Tools)
 def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemble_retriever):
     """
@@ -22,49 +65,6 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             end = d.metadata.get('end_line', 'Unknown')
             result.append(f"【檔案: {source} (行號 {start}-{end})】\n片段內容:\n{content}\n")
         return "\n\n---\n\n".join(result)
-    
-    def resolve_best_repo_path(log_path_hint: str, target_repo_dir: str) -> str:
-        """根據 Log 提供的路徑，利用最長共同目錄比對 (Longest Common Suffix) 找出真實的 Repo 路徑"""
-        if not log_path_hint:
-            return ""
-        # 將 Log 路徑統一為 POSIX 格式以便切割
-        log_parts = Path(log_path_hint.replace("\\", "/")).parts
-        target_filename = log_parts[-1] # 取得最右邊的純檔名
-    
-        candidates = []
-        # 掃描 Repo 找出所有「檔名完全相同」的檔案
-        for root, dirs, files in os.walk(target_repo_dir):
-            dirs[:] = [d for d in dirs if d not in ignore_dirs] # 濾除不需要掃描的資料夾
-            if target_filename in files:
-                candidates.append(os.path.join(root, target_filename))
-            
-        if not candidates:
-            return ""
-        
-        # 如果只有一個，就直接回傳，省下比對時間
-        if len(candidates) == 1:
-            return candidates[0]
-                
-        # 如果有多個同名檔案，進行從右到左的資料夾比對
-        best_match = ""
-        max_score = -1
-    
-        for cand_path in candidates:
-            cand_parts = Path(cand_path).parts
-        
-            # 從右往左 (reversed) 逐層比對：檔名 -> 父資料夾 -> 祖父資料夾...
-            score = 0
-            for log_p, cand_p in zip(reversed(log_parts), reversed(cand_parts)):
-                if log_p.lower() == cand_p.lower():
-                    score += 1
-                else:
-                    break # 一旦遇到不同的資料夾名稱就停止計分
-                
-            if score > max_score:
-                max_score = score
-                best_match = cand_path
-            
-        return best_match
 
     @tool
     def read_code_snippet(file_path_hint: str, start_line: int, end_line: int) -> str:
@@ -75,7 +75,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         """
         print(f"read_code_snippet, file_path_hint = {file_path_hint}, start_line = {start_line}, end_line = {end_line}")
 
-        actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+        actual_path = resolve_best_repo_path(file_path_hint, repo_dir, ignore_dirs)
     
         if not actual_path:
             return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
@@ -96,7 +96,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
     
         print(f"get_git_blame, file_path_hint = {file_path_hint}, line_number = {line_number}")
     
-        actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+        actual_path = resolve_best_repo_path(file_path_hint, repo_dir, ignore_dirs)
     
         if not actual_path:
             return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
@@ -177,7 +177,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         print(f"read_symbol_code, file_path_hint = {file_path_hint}, target_symbol = {target_symbol}")
         
         # 1. 先利用已有的智慧比對，找出真實的檔案路徑
-        actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+        actual_path = resolve_best_repo_path(file_path_hint, repo_dir, ignore_dirs)
         if not actual_path:
             return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
 
@@ -243,7 +243,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         print(f"read_function_by_line, file_path_hint = {file_path_hint}, line_number = {line_number}")
         
         # 1. 找出真實的檔案路徑
-        actual_path = resolve_best_repo_path(file_path_hint, repo_dir)
+        actual_path = resolve_best_repo_path(file_path_hint, repo_dir, ignore_dirs)
         if not actual_path:
             return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
 
@@ -453,7 +453,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             report.append(f"📄 檔案: {file_path}")
             
             # 1. 取得實際檔案路徑與 AST 邊界實體
-            actual_path = resolve_best_repo_path(file_path, repo_dir)
+            actual_path = resolve_best_repo_path(file_path, repo_dir, ignore_dirs)
             target_entities = None
             
             # 優先嘗試實際比對路徑

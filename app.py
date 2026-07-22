@@ -1,6 +1,7 @@
 import os
 import configparser
 import time
+import json
 from typing import List, Dict, Optional
 from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field
@@ -22,6 +23,7 @@ from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from tools import create_agent_tools
+from tools import resolve_best_repo_path
 from database import build_or_load_retriever
 
 IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
@@ -40,14 +42,19 @@ class SingleBugReport(BaseModel):
     logs: Dict[str, str] = Field(default_factory=dict, description="紀錄該 bug 底下所有的 log，格式為 { 'application.log_1': 'log內容...' }")
 
 # 定義預期的 Log 結構
+class TraceFrame(BaseModel):
+    file_name: str = Field(description="Log 中提到的檔案路徑或名稱")
+    line_number: int = Field(description="對應的行號")
+
 class LogClues(BaseModel):
-    error_type: Optional[str] = Field(default=None, description="明確的錯誤類型，如 TypeError，若無則留空")
-    file_name: Optional[str] = Field(
-        default=None,
-        description="Log 中提到的錯誤檔案路徑（請直接擷取 Log 中顯示的路徑，例如 /path/code/.../main.cpp 或 src/main.cpp，能抓多完整就抓多完整）"
+    error_type: Optional[str] = Field(default=None, description="明確的錯誤類型...")
+    file_name: Optional[str] = Field(default=None, description="錯誤發生的主要檔案路徑...")
+    line_number: Optional[int] = Field(default=-1, description="錯誤發生的行號...")
+    semantic_issue: str = Field(default="", description="將 Log 的行為總結為一句...")
+    execution_trace: List[TraceFrame] = Field(
+        default_factory=list, 
+        description="從 Log 推導出的前三層執行軌跡 (Stack Trace)，由發生問題的最深層往外推。"
     )
-    line_number: Optional[int] = Field(default=-1, description="錯誤發生的行號，若無則為 -1")
-    semantic_issue: str = Field(default="", description="將 Log 的行為總結為一句語意描述，例如：'事件迴圈重複觸發'")
 
 class DetectiveCommand(BaseModel):
     """工程師開給探員的情報需求單"""
@@ -144,6 +151,10 @@ rag_agent_system_prompt = """你是一個專為「AI 檢索探員 (RAG Agent)」
    - 將人類的「行為描述」轉換為「系統狀態異常描述」。
    - ❌ 錯誤示範 (太口語)："QA 說按下結帳按鈕後畫面卡住了，RD 覺得可能是 API 沒回傳，叫我看一下 login log。"
    - ✅ 正確示範 (具檢索價值)："觸發 Checkout 按鈕後發生 timeout，疑似 PaymentGateway 模組中的 fetch_user_token 未正確處理空值回傳。"
+   
+4. 執行軌跡 (execution_trace):
+   - 若 Log 包含 Stack Trace 或多筆時序紀錄，請由下而上 (或依發生順序) 萃取最接近錯誤點的前 3 層檔案名稱與行號。
+   - 這些軌跡將作為工程師推演「問題是如何一步步發生」的重要依據。
 
 請保持冷靜、客觀，忽略無關痛癢的對話，輸出最精煉的技術線索。"""
 
@@ -176,7 +187,8 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，不要瞎猜路徑，請指示探員使用語意搜尋。
 
 【📝 輸出要求】
-請根據你是否已經找到 Root Cause，決定 "is_resolved" 的布林值。
+請根據你是否已經找到 Root Cause，決定 is_resolved 的布林值。
+請直接輸出符合預期的 JSON 結構，絕對不要包含任何 Markdown 標記 (如 ```json) 或其他說明文字。
 
 【輸出範例 - 請完全照抄此結構，不要加任何其他字】
 {{
@@ -503,6 +515,92 @@ def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
     
     return result["output"]
 
+def enrich_trace_with_code(clues: LogClues, tools) -> str:
+    """根據解析出的軌跡，從 AST 與 Reference 字典中萃取：檔案、Function、行號以及使用的變數"""
+    if not clues.execution_trace:
+        return clues.model_dump_json(indent=2)
+        
+    # 取得路徑設定
+    repo_dir = config["Default"]["RepoDir"]
+    db_dir = config["Default"]["FAISSDBDir"]
+    bounds_path = os.path.join(db_dir, "symbol_bounds.json")
+    refs_path = os.path.join(db_dir, "symbol_references.json")
+    
+    # 1. 預先讀取兩個字典
+    ast_data = {}
+    if os.path.exists(bounds_path):
+        with open(bounds_path, "r", encoding="utf-8") as f:
+            ast_data = json.load(f)
+            
+    refs_data = {}
+    if os.path.exists(refs_path):
+        with open(refs_path, "r", encoding="utf-8") as f:
+            refs_data = json.load(f)
+            
+    trace_context = []
+    # 只取前三層軌跡
+    for i, frame in enumerate(clues.execution_trace[:3]):
+        # 利用 resolve_best_repo_path 找真實路徑
+        actual_path = resolve_best_repo_path(frame.file_name, repo_dir, IGNORE_DIRS)
+        func_name = "Unknown"
+        func_bounds = None
+        used_symbols = set() # 存放該函數內使用的變數/符號
+        
+        if actual_path:
+            target_entities = None
+            
+            # (A) 從 bounds 字典找出對應檔案的實體
+            for dict_file_path, entities in ast_data.items():
+                if os.path.normpath(dict_file_path) == os.path.normpath(actual_path):
+                    target_entities = entities
+                    break
+                    
+            if target_entities:
+                matched_bounds = None
+                # 優先找函數 (範圍最小的)
+                for fname, bounds in target_entities.get("functions", {}).items():
+                    if bounds["start_line"] <= frame.line_number <= bounds["end_line"]:
+                        if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
+                            func_name = fname
+                            matched_bounds = bounds
+                            
+                # 沒找到函數則找類別
+                if not matched_bounds:
+                    for cname, bounds in target_entities.get("classes", {}).items():
+                        if bounds["start_line"] <= frame.line_number <= bounds["end_line"]:
+                            if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
+                                func_name = cname
+                                matched_bounds = bounds
+                                
+                func_bounds = matched_bounds
+                
+            # (B) 如果有找到函數範圍，去 refs 字典撈出裡面用到的所有符號
+            if func_bounds and refs_data:
+                start_l = func_bounds["start_line"]
+                end_l = func_bounds["end_line"]
+                
+                # 遍歷所有的 Reference 尋找落在這份檔案與這個行號區間的符號
+                for symbol, file_refs in refs_data.items():
+                    # 尋找這個符號是否有在我們目前的實際檔案路徑中被呼叫
+                    for ref_file_path, lines in file_refs.items():
+                        if os.path.normpath(ref_file_path) == os.path.normpath(actual_path):
+                            # 檢查是否有行號落在該函數 (start_l ~ end_l) 範圍內
+                            if any(start_l <= l <= end_l for l in lines):
+                                # 過濾掉自己 (不要把函數名稱自己也算進去)
+                                if symbol != func_name:
+                                    used_symbols.add(symbol)
+                            break
+                            
+        # 組裝精簡版的軌跡字串
+        symbol_str = ", ".join(sorted(list(used_symbols))) if used_symbols else "無/無法辨識"
+        trace_info = (f"🔻 【軌跡 {i+1}】 檔案: {frame.file_name} | Function: {func_name} | 行號: {frame.line_number}\n"
+                      f"    ↳ 內部參照符號/變數: {symbol_str}")
+        trace_context.append(trace_info)
+            
+    # 將結果合併回 JSON
+    enriched_info = clues.model_dump()
+    enriched_info["enriched_code_trace"] = "\n".join(trace_context)
+    return json.dumps(enriched_info, ensure_ascii=False, indent=2)
 
 # ==========================================
 # 主程式：完整工作流整合
@@ -548,7 +646,8 @@ if __name__ == "__main__":
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
         clues = parse_report(llm_json, report)
-        print(f"萃取線索: {clues}\n")
+        enriched_clues_json = enrich_trace_with_code(clues, tools)
+        print(f"萃取線索: {enriched_clues_json}\n")
         
         # 初始化 State
         initial_state = {
@@ -556,7 +655,7 @@ if __name__ == "__main__":
             "steps": report.steps_to_reproduce,
             # 將這裡的反斜線替換掉，保護 Agentic 流程的 JSON 解析
             "logs": "\n".join([f"=== {k} ===\n{v}" for k, v in report.logs.items()]).replace("\\", "/"),
-            "log_clues": clues.model_dump_json(),
+            "log_clues": enriched_clues_json,
             
             # 變數更名
             "investigation_history": [],
