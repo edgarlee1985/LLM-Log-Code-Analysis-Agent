@@ -63,12 +63,26 @@ class LogClues(BaseModel):
 
 class DetectiveCommand(BaseModel):
     """工程師開給探員的情報需求單"""
-    hypothesis: str = Field(default="", description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'")
-    # 🔴 允許工程師直接下令使用特定工具
-    action_type: str = Field(default="", description="要執行的檢索動作，請直接填寫強烈建議探員使用的「工具名稱」，例如：read_symbol_code, analyze_class_architecture, semantic_code_search")
-    target_value: str = Field(default="", description="對應的關鍵字、檔案路徑、類別名稱 (如 JetsonOrinDeployer) 或語意描述")
-    # 🔴 提示工程師可以下達關於繼承的指令
-    focus_point: str = Field(default="", description="請探員特別注意什麼？例如：'請幫我找出這個 class 繼承了哪個父類別'、'檢查是否有 override'")
+    hypothesis: str = Field(
+        default="", 
+        description="目前正在驗證的假設，例如：'我懷疑 user_login 函數沒有正確處理 null 值'"
+    )
+    action_type: str = Field(
+        default="", 
+        description="請填寫本次檢索的核心意圖，請從以下 4 種分類中選擇最適合的一項填入：\n"
+                    "1. 'TRACE_STATE': 追蹤特定「變數」或「屬性」的讀取與修改軌跡。\n"
+                    "2. 'INSPECT_LOGIC': 閱讀已知「函數」、「類別」或「具體行號」的內部實作邏輯。\n"
+                    "3. 'SEARCH_CONCEPT': 透過報錯 Log、字串或口語描述，在全域尋找異常落點。\n"
+                    "4. 'ANALYZE_STRUCTURE': 調查類別的「繼承關係 (父子類別)」或「成員架構」。"
+    )
+    target_value: str = Field(
+        default="", 
+        description="對應的搜尋目標，例如：變數名稱 (m_buttons)、函數名稱、檔案路徑或一段 Log 描述"
+    )
+    focus_point: str = Field(
+        default="", 
+        description="請探員特別注意什麼？例如：'請找出這個變數在哪裡被賦值'、'檢查是否有 override'"
+    )
 
 class EngineerEvaluation(BaseModel):
     """工程師的深度分析與決策報告"""
@@ -167,42 +181,28 @@ rag_agent_system_prompt = """你是一個專為「AI 檢索探員 (RAG Agent)」
 engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責帶領團隊進行複雜系統的除錯 (Debugging)。
 你的唯一目標是找出系統 Bug 的根本原因 (Root Cause) 並提出精確的修復方案。
 
-你目前正在與一位「檢索探員 (Detective)」合作。探員負責深入 Codebase 撈取程式碼，而你負責指揮他。
+你目前正在與一位「檢索探員 (Detective)」合作。探員配備了多種檢索工具，你負責提供假設並指揮他。
 
-【🎯 核心除錯戰略 (Core Debugging Strategy)】
-1. 由廣入深與精準打擊 (Macro vs. Micro)：
-   - [檔案與行號定位]：若你從 Log 中明確得知出錯的「檔案名稱與行號」，請務必優先使用 `read_function_by_line` 工具，探員會自動利用 AST 幫你切出該行所屬的完整函數邏輯。只有當該工具回報找不到邊界時，才降級使用 `read_code_snippet`。
-   - [精準打擊]：一旦從 Log 或初步探索中「明確得知目標變數、函數或類別名稱」，請立即切換策略！優先使用 `read_symbol_code` 提取該符號的完整實作，或使用 `find_symbol_references` 追蹤引用，嚴禁繼續用 read_code_snippet 盲目讀取大量無關程式碼。
-2. 減少上下文碎片化：
-   - 盡量在一次指令中要求獲取完整的執行路徑，避免「查 A 函數 -> 發現裡面有 B 變數 -> 再下指令查 B 變數」的低效行為。
-3. 避免重複與指令推進 (Push Forward)：
-   - 如果探員上一輪已經回報某個方向失敗，你的下一輪指令【絕對不可以】再叫探員去查一樣的地方或退回起點！
-   - 你必須推進邏輯：指派探員使用 `analyze_class_architecture` 工具找出父類別。指令必須越來越微觀。
-
-4. 物件導向 (OOP) 與多型陷阱 (Polymorphism) 專屬守則：
-   - [調查族譜]：當你發現目標與「類別 (Class)」或「物件」有關時，必須優先指派探員使用 `analyze_class_architecture` 了解該類別的繼承關係 (Base Classes)。
-   - [父類別回溯]：如果子類別中找不到目標變數或函數，它極有可能定義在「父類別」中。請立刻要求探員去讀取父類別的實作。
-   - [建構子陷阱]：在 C++ 中，在建構子 (Constructor) 內部呼叫虛擬函數 (Virtual Function) 時，不會觸發多型！它只會執行當前類別（或父類別）的實作，不會執行子類別的 Override。請特別留意 Log 是否從建構子發出。
+【🎯 核心指揮戰略 (Command Strategy)】
+1. 巨觀探索 (Macro)：當只有語意線索時，請下令使用 `semantic_code_search` 或 `exact_keyword_search` 找出相關邏輯落點。
+2. 函數與架構解析 (Micro)：當你已經知道具體的檔案、函數或類別名稱時，請明確指示探員使用 `read_function_by_line`、`read_symbol_code` 或 `analyze_class_architecture` 獲取完整實作。
+3. 變數與狀態追蹤 (State Tracking)：當你懷疑某個「變數」或「狀態」不同步時，這是最關鍵的時刻！請【絕對優先】下令使用 `find_symbol_references` 來追蹤該變數在哪裡被讀取或修改，切勿要求探員去盲目閱讀大量無關的函數。
+4. 推進邏輯：如果探員上一輪回報某個方向失敗，下一輪絕對不可以叫探員查一樣的地方。指令必須越來越微觀。
 
 【💡 工作模式：假設驅動 (Hypothesis-Driven)】
-你必須嚴格遵循以下思考循環：
-1. 觀察 (Observe)：仔細閱讀使用者的 Bug 重現步驟與原始系統 Log。
-2. 回顧 (Review)：檢視你與探員的「歷史調查紀錄」。特別留意上一次的假設是否被推翻。
-3. 推理 (Reasoning)：將 Log 線索與探員帶回的程式碼進行交叉比對，找出邏輯斷層。
-4. 假設 (Hypothesis)：針對可能出錯的邏輯提出具體假設。
-5. 行動 (Action)：如果你確信已找到 Root Cause，宣告結案並撰寫報告；若證據不足，開立情報需求單給探員。
+1. 觀察：仔細閱讀使用者的 Bug 重現步驟與原始系統 Log。
+2. 回顧：檢視歷史調查紀錄，留意上一次的假設是否被推翻。
+3. 推理：將 Log 線索與探員帶回的程式碼進行交叉比對，找出邏輯斷層。
+4. 行動：開立情報需求單 (DetectiveCommand) 給探員。請在 `action_type` 欄位精確填寫建議使用的工具名稱。
 
 【🚨 核心守則】
-1. 絕不憑空捏造：絕對不要幻想或猜測未被檢索出來的程式碼邏輯。
-2. 保持專注：只針對導致「當前 Bug Log」的程式碼進行排查。
-3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，請指示探員使用語意搜尋。
+1. 絕不憑空捏造未被檢索出來的程式碼邏輯。
+2. 只針對導致「當前 Bug Log」的程式碼進行排查。
+3. 終止條件：只要你已經明確知道 Bug 發生在哪個檔案、哪一行，且能寫出具體的修復程式碼 (Fix)，就【必須】將 is_resolved 設為 true 並輸出 final_report，絕對禁止再指派毫無意義的確認任務給探員。
 
 【📝 輸出要求與 JSON 防呆守則 (極度重要)】
-1. 請嚴格遵守下方提供的 JSON 結構格式進行輸出。
-2. 如果你需要於 reasoning 或 hypothesis 欄位中「引用任何程式碼或 Log 內容」，請務必將原程式碼的「雙引號 (\")」替換為「單引號 (')」！
-3. 絕對不可以在 JSON 的字串值內部直接出現未跳脫的雙引號，這會導致系統 JSON 解析器嚴重崩潰！
-   ❌ 錯誤示範: "step_by_step_reasoning": "我看到程式碼呼叫了 qDebug() << "on_pushButton_clicked""
-   ✅ 正確示範: "step_by_step_reasoning": "我看到程式碼呼叫了 qDebug() << 'on_pushButton_clicked'"
+1. 如果你需要於 reasoning 或 hypothesis 欄位中「引用任何程式碼或 Log 內容」，請務必將原程式碼的「雙引號 (\")」替換為「單引號 (')」！
+2. 絕對不可以在 JSON 的字串值內部直接出現未跳脫的雙引號。
 
 {format_instructions}
 """
@@ -221,14 +221,23 @@ engineer_human_prompt = """
 """
 
 # =================================================================================
-detective_system_prompt = """你是一個精準的程式碼檢索探員。
-        你的任務是根據工程師的需求單，使用適當的工具去尋找程式碼。
-        
-        【嚴格守則】
-        1. 誠實回報：如果工具回報錯誤（例如檔案找不到、路徑錯誤、無搜尋結果），請「原封不動」回傳錯誤訊息給工程師，絕對不要編造程式碼或隱瞞錯誤！
-        2. 精簡輸出：找到程式碼後，只需整理出「檔案名稱」、「行號」與「完整的程式碼片段」。不需要長篇大論解釋，工程師會自己看。
-        3. 嚴格文字回報：請用自然語言回報你找到的內容，絕對不要直接回傳 JSON 格式的原始資料。"""
+detective_system_prompt = """你是一個精準且高效的程式碼檢索探員。
+你的任務是解讀工程師的需求單，並自主選擇最適合的工具去 Codebase 撈取情報。
 
+【🛠️ 工具選擇 SOP (極度重要)】
+工程師會建議你使用某個工具 (action_type)，但你必須根據當下情況做出最聰明的判斷：
+1. 遇到「檔案與行號」：優先使用 `read_function_by_line`。只有當該工具回報找不到邊界時，你才可以降級使用 `read_code_snippet` 讀取附近小範圍的程式碼。
+2. 遇到「變數追蹤」：如果工程師想查某個「變數」的定義或修改軌跡，你【必須且只能】使用 `find_symbol_references`。絕對禁止為了找變數去呼叫 `analyze_class_architecture` 或大範圍的 `read_code_snippet`。
+3. 遇到「類別繼承」：追蹤物件導向的多型問題時，優先使用 `analyze_class_architecture` 釐清父子類別關係，再用 `find_virtual_overrides` 找實作。
+
+【🚨 探員嚴格守則】
+1. 禁止盲目掃描：絕不可以使用 `read_code_snippet` 一次讀取超過 50 行的程式碼！如果需要大範圍閱讀，代表你的檢索策略錯了，請改用語意搜尋或 Reference 追蹤。
+2. 誠實回報：如果工具回報錯誤（例如檔案找不到、路徑錯誤），請「原封不動」回傳錯誤訊息給工程師，絕對不要編造程式碼。
+3. 推進式檢索：在你的自主迴圈中，如果發現查錯方向，請立即換工具或換關鍵字，不要在同一個錯誤點死胡同裡連續呼叫相同的工具。
+4. 嚴格文字回報：請用自然語言精簡回報你找到的內容（檔案、行號、程式碼重點），絕對不要直接回傳 JSON 格式的原始資料。
+"""
+
+# =================================================================================
 def read_bug_report(report_dir: str) -> List[SingleBugReport]:
     """
     從指定目錄讀取所有的 Bug reports 並轉換為 SingleBugReport 物件列表。
@@ -449,20 +458,18 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
 
     def detective_node(state: GraphState):
         print(f"\n[Detective Node] 啟動 (第 {state['iterations']} 次迭代)")
+
+        req = state.get("current_request")
+        if not req:
+            # 理論上在 Engineer First 架構下永遠不會觸發，除非狀態被意外清空
+            raise ValueError("探員未收到工程師的情報需求單 (current_request 為空)！")
         
         # 準備 Search Query 
-        if state.get("current_request"):
-            req = state["current_request"]
-            search_query = (
-                f"【目標】: {req.get('target_value')}\n"
-                f"【任務類型】: {req.get('action_type')}\n"
-                f"【工程師的假設】: {req.get('hypothesis')}\n"
-                f"【關注點】: {req.get('focus_point')}"
-            )
-        else:
-            search_query = (
-                f"這是第一次調查。請根據以下 Log 線索：{state['log_clues']}\n"
-                f"【指令】：請只挑選「最可能發生問題的 1 個檔案或 1 個函數」進行檢索。不要一次查詢多個目標！"
+        search_query = (
+            f"【目標】: {req.get('target_value')}\n"
+            f"【任務類型】: {req.get('action_type')}\n"
+            f"【工程師的假設】: {req.get('hypothesis')}\n"
+            f"【關注點】: {req.get('focus_point')}"
             )
         
         # 將 Prompt 轉換為標準的 Message 陣列
@@ -586,10 +593,10 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
     workflow.add_node("engineer", engineer_node)
     
     # 2. 定義流程順序 (Edges)
-    workflow.set_entry_point("detective") # 入口點
-    workflow.add_edge("detective", "engineer") # Detective 找完資料，必定交給 Engineer
+    workflow.set_entry_point("engineer") # 入口點
     
     # 3. 條件路由 (Conditional Edge)
+    # Engineer 分析完後，決定是結束，還是發配任務給 Detective
     workflow.add_conditional_edges(
         "engineer",
         should_continue,
@@ -598,6 +605,9 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
             "end": END                 # 如果解決了，走向 END
         }
     )
+
+    # 4. Detective 執行完後，必定交回給 Engineer 進行下一步評估
+    workflow.add_edge("detective", "engineer")
     
     return workflow.compile()
 
