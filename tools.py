@@ -462,6 +462,70 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             report.append("- 🛠️ 類別方法: 無或未偵測到")
             
         return "\n".join(report)
+
+    @tool
+    def find_virtual_overrides(function_name: str, base_class: str) -> str:
+        """
+        【功能】尋找某個虛擬函數 (Virtual Function) 在哪些子類別中被覆寫 (Override)。
+        
+        【使用時機】
+        - 當你發現程式碼透過父類別指標呼叫函數 (例如 base->doSomething())，想知道實際執行的子類別程式碼在哪裡時使用。
+        
+        【禁用時機 (絕對不要用)】
+        - 無特別註明。
+
+        【輸入規範】
+        - function_name: 函數名稱 (例如 'paintEvent')。
+        - base_class: 定義該虛擬函數的父類別名稱。
+        """
+        print(f"find_virtual_overrides, function_name = {function_name}, base_class = {base_class}")
+        
+        tree_path = os.path.join(db_dir, "class_dependency_tree.json")
+        if not os.path.exists(tree_path):
+            return "錯誤：相依樹檔案不存在。"
+            
+        try:
+            with open(tree_path, "r", encoding="utf-8") as f:
+                graph = json.load(f)
+        except Exception as e:
+            return f"讀取相依樹檔案失敗: {e}"
+            
+        if base_class not in graph:
+            return f"找不到父類別 '{base_class}'，請確認名稱是否正確。"
+            
+        # 遞迴尋找所有子類別
+        all_derived_classes = set()
+        def find_derived(cls_name):
+            derived = graph.get(cls_name, {}).get("implemented_by", [])
+            for d in derived:
+                if d not in all_derived_classes:
+                    all_derived_classes.add(d)
+                    find_derived(d) # 繼續往下找孫類別
+                    
+        find_derived(base_class)
+        
+        if not all_derived_classes:
+            return f"類別 '{base_class}' 沒有任何子類別。"
+            
+        # 檢查哪些子類別有 override 這個函數
+        overridden_in = []
+        for d_cls in all_derived_classes:
+            methods = graph.get(d_cls, {}).get("methods", [])
+            for m in methods:
+                if m.get("name") == function_name: # 只比對名稱
+                    overridden_in.append(d_cls)
+                    break
+                    
+        if not overridden_in:
+            return f"在 '{base_class}' 的所有子類別中，沒有找到覆寫 '{function_name}' 的實作。"
+            
+        report = [f"🔍 虛擬函數追蹤: {base_class}::{function_name}"]
+        report.append(f"以下子類別覆寫了此函數 (共 {len(overridden_in)} 個):")
+        for cls in overridden_in:
+            report.append(f"- {cls}")
+            
+        report.append("\n💡 提示：你可以使用 `read_symbol_code` 工具來閱讀上述子類別的詳細實作。")
+        return "\n".join(report)
     
     @tool
     def find_symbol_references(symbol_name: str) -> str:
@@ -610,4 +674,5 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
             read_symbol_code,
             read_function_by_line,
             analyze_class_architecture,
+            find_virtual_overrides,
             find_symbol_references]
