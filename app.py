@@ -31,7 +31,7 @@ from tools import create_agent_tools
 from tools import resolve_best_repo_path
 from database import build_or_load_retriever
 
-IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist'}
+IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist', '.ipynb_checkpoints'}
 
 # 創建 configparser 物件
 config = configparser.ConfigParser()
@@ -827,7 +827,7 @@ if __name__ == "__main__":
         
         bug_end_time = time.perf_counter() # 記錄 bug 結束時間
         bug_total_time = bug_end_time - bug_start_time
-        print("--- {report.bug_id} 花費時間 ---")
+        print(f"--- {report.bug_id} 花費時間 ---")
         print(f"\nbug 執行時間：{bug_total_time:.4f} 秒")
         # 迴圈尾聲：印出【單次 Bug】的消耗
         print(f"\n📊 --- {report.bug_id} Token 消耗 --- 📊")
