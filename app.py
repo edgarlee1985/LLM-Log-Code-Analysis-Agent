@@ -16,6 +16,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_classic.output_parsers import OutputFixingParser
 from langchain_ollama import ChatOllama
 from langchain_ollama import OllamaEmbeddings
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
@@ -175,7 +176,7 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 2. 減少上下文碎片化：
    - 盡量在一次指令中要求獲取完整的執行路徑，避免「查 A 函數 -> 發現裡面有 B 變數 -> 再下指令查 B 變數」的低效行為。
 3. 避免重複與指令推進 (Push Forward)：
-   - 如果探員上一輪已經回報某個方向失敗 (例如 Device 找不到 hardwareMode)，你的下一輪指令【絕對不可以】再叫探員去查一樣的地方或退回起點！
+   - 如果探員上一輪已經回報某個方向失敗，你的下一輪指令【絕對不可以】再叫探員去查一樣的地方或退回起點！
    - 你必須推進邏輯：指派探員使用 `analyze_class_architecture` 工具找出父類別。指令必須越來越微觀。
 
 4. 物件導向 (OOP) 與多型陷阱 (Polymorphism) 專屬守則：
@@ -188,30 +189,22 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 1. 觀察 (Observe)：仔細閱讀使用者的 Bug 重現步驟與原始系統 Log。
 2. 回顧 (Review)：檢視你與探員的「歷史調查紀錄」。特別留意上一次的假設是否被推翻。
 3. 推理 (Reasoning)：將 Log 線索與探員帶回的程式碼進行交叉比對，找出邏輯斷層。
-4. 假設 (Hypothesis)：針對可能出錯的邏輯提出具體假設（例如："我懷疑 `calculate_total` 沒有處理空陣列"）。
-5. 行動 (Action)：如果你確信已找到 Root Cause，宣告結案並撰寫報告；若證據不足，開立符合「由廣入深」戰略的情報需求單給探員。
+4. 假設 (Hypothesis)：針對可能出錯的邏輯提出具體假設。
+5. 行動 (Action)：如果你確信已找到 Root Cause，宣告結案並撰寫報告；若證據不足，開立情報需求單給探員。
 
 【🚨 核心守則】
 1. 絕不憑空捏造：絕對不要幻想或猜測未被檢索出來的程式碼邏輯。
 2. 保持專注：只針對導致「當前 Bug Log」的程式碼進行排查。
-3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，不要瞎猜路徑，請指示探員使用語意搜尋。
+3. 善用語意搜尋：如果你不知道具體的檔名或函數名稱，請指示探員使用語意搜尋。
 
-【📝 輸出要求】
-請根據你是否已經找到 Root Cause，決定 is_resolved 的布林值。
-請直接輸出符合預期的 JSON 結構，絕對不要包含任何 Markdown 標記 (如 ```json) 或其他說明文字。
+【📝 輸出要求與 JSON 防呆守則 (極度重要)】
+1. 請嚴格遵守下方提供的 JSON 結構格式進行輸出。
+2. 如果你需要於 reasoning 或 hypothesis 欄位中「引用任何程式碼或 Log 內容」，請務必將原程式碼的「雙引號 (\")」替換為「單引號 (')」！
+3. 絕對不可以在 JSON 的字串值內部直接出現未跳脫的雙引號，這會導致系統 JSON 解析器嚴重崩潰！
+   ❌ 錯誤示範: "step_by_step_reasoning": "我看到程式碼呼叫了 qDebug() << "on_pushButton_clicked""
+   ✅ 正確示範: "step_by_step_reasoning": "我看到程式碼呼叫了 qDebug() << 'on_pushButton_clicked'"
 
-【輸出範例 - 請完全照抄此結構，不要加任何其他字】
-{{
-    "step_by_step_reasoning": "我剛剛看到...這代表...我接下來需要確認...",
-    "is_resolved": false,
-    "next_search_request": {{
-        "hypothesis": "我懷疑 Button 沒有綁定正確的 index",
-        "action_type": "READ_FILE",
-        "target_value": "/path/code/src/GenTestLogProject.cpp",
-        "focus_point": "檢查 OnButtonClikced 的實作邏輯"
-    }},
-    "final_report": ""
-}}
+{format_instructions}
 """
 
 engineer_human_prompt = """
@@ -393,26 +386,29 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
         else:
             history_text = "\n\n".join(state["investigation_history"])
         
+        # 建立 JsonOutputParser，並綁定你的 Pydantic 模型
+        base_parser = JsonOutputParser(pydantic_object=EngineerEvaluation)
+
+        fixing_parser = OutputFixingParser.from_llm(parser=base_parser, llm=engineer_llm)
+
+        # 在 Prompt 結尾動態注入 Parser 產生的「嚴格格式說明 (format_instructions)」
         prompt = ChatPromptTemplate.from_messages([
             ("system", engineer_system_prompt),
             ("human", engineer_human_prompt)
         ])
 
-        structured_llm = engineer_llm.with_structured_output(EngineerEvaluation)
+        analysis_chain = prompt | engineer_llm | fixing_parser
 
-        # 建立管線
-        analysis_chain = (
-            prompt | structured_llm
-        )
-        
-         # 執行
-        evaluation = {}
         llm_input = {
             "steps": state["steps"],
             "investigation_history": history_text,
+            "format_instructions": base_parser.get_format_instructions() 
         }
+
+        evaluation = {}
         try:
-            evaluation = analysis_chain.invoke(llm_input)
+            evaluation_dict = analysis_chain.invoke(llm_input)
+            evaluation = EngineerEvaluation(**evaluation_dict)
             
         except (Exception, ValidationError) as e:
             print(f"⚠️ 解析 JSON 或生成失敗: {e}")
@@ -765,7 +761,7 @@ if __name__ == "__main__":
 
     llm_json = ChatOllama(model=config["Default"]["ModelName"],
                         temperature=0.0,
-                        seed=50, repeat_penalty=1.2,
+                        seed=50, repeat_penalty=1.0,
                         num_ctx=16384,
                         num_predict=4096,
                         format="json", 
