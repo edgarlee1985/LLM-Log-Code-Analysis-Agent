@@ -214,8 +214,8 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         
         【禁用時機 (絕對不要用)】
         - ❌ 本工具無法搜尋「變數 (Variable)」。
-        - ❌ 若要尋找成員變數的定義，請改用 `analyze_class_architecture` 或是 `exact_keyword_search`。
         - ❌ 若要追蹤變數在哪裡被呼叫或修改，請改用 `find_symbol_references`。
+        - ❌ 嚴禁為了尋找特定成員變數而呼叫 `analyze_class_architecture`，這會浪費大量 Token！
         - ❌ 絕對不能傳入一段 Log 句子或口語文字。
         
         【輸入規範】
@@ -382,7 +382,7 @@ def create_agent_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemb
         - 如果你在追蹤某個類別的方法卻找不到時，請立刻對該類別使用此工具，查看它的「繼承自 (Base Classes)」，然後去父類別尋找該方法。
         
         【禁用時機 (絕對不要用)】
-        - 無特別註明。
+        - ❌ 如果你只是想追蹤「某個特定的變數或函數」為何出錯，絕對不要使用此工具！請改用 `find_symbol_references` 或 `read_symbol_code`，避免回傳過多無關資訊。
         
         【輸入規範】
         - class_name 必須輸入目標 Class 的名稱。
