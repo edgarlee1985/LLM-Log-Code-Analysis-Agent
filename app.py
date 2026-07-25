@@ -4,7 +4,7 @@ import time
 import json
 from typing import List, Dict, Optional
 from typing import Annotated, TypedDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic import ValidationError
 from pathlib import Path
 
@@ -88,8 +88,14 @@ class EngineerEvaluation(BaseModel):
     """工程師的深度分析與決策報告"""
     step_by_step_reasoning: str = Field(default="", description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
     is_resolved: bool = Field(default=False, description="是否已經找到 Root Cause 並能提出修復方案？")
-    next_search_request: Optional[DetectiveCommand] = Field(default=None, description="如果尚未解決，指派給探員的下一步檢索指令")
+    next_search_request: Optional[DetectiveCommand] = Field(default=None, description="【極度重要】當 is_resolved 為 false 時，此欄位【絕對必填】！請務必填寫下一步的檢索指令。只有當 is_resolved 為 true 時才允許留空 (null)。")
     final_report: Optional[str] = Field(default=None, description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
+    @model_validator(mode='after')
+    def check_request_if_not_resolved(self) -> 'EngineerEvaluation':
+        # 如果尚未解決，但 LLM 卻沒有給下一步指令，強制報錯
+        if not self.is_resolved and not self.next_search_request:
+            raise ValueError("當 is_resolved 為 false 時，next_search_request 絕對不能為空！")
+        return self
 
 
 # ==========================================
