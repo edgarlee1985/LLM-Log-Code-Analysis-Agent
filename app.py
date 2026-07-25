@@ -27,8 +27,7 @@ from langgraph.errors import GraphRecursionError
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from tools import create_agent_tools
-from tools import resolve_best_repo_path
+from tools import *
 from database import build_or_load_retriever
 
 IGNORE_DIRS = {'.git', '.vscode', 'build', 'venv', '.venv', 'dist', '.ipynb_checkpoints'}
@@ -799,7 +798,17 @@ if __name__ == "__main__":
     
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
     ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
-    tools = create_agent_tools(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
+    init_tools(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
+    tools = [semantic_code_search,
+            read_code_snippet,
+            get_git_blame,
+            exact_keyword_search,
+            read_symbol_code,
+            read_function_by_line,
+            analyze_class_architecture,
+            find_virtual_overrides,
+            find_symbol_references]
+
     # 建立 Graph
     debugger_app = build_debugging_graph(llm_json, llm_text, tools)
 
