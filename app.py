@@ -211,6 +211,9 @@ engineer_human_prompt = """
 【Bug 重現步驟】
 {steps}
 
+【結構化 Log 線索 (Log Clues)】
+{log_clues}
+
 【歷史調查紀錄 (Investigation History)】
 {investigation_history}
 
@@ -391,7 +394,7 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
         
         # 將歷史紀錄從 List[str] 組裝成單一字串，讓 LLM 閱讀
         if not state.get("investigation_history"):
-            history_text = "目前尚無調查紀錄，這是第一次推論。請根據 Log 提出第一個假設並指派探員去檢索。"
+            history_text = "目前尚無調查紀錄，這是第一次推論。請根據萃取出的線索提出第一個假設並指派探員去檢索。"
         else:
             history_text = "\n\n".join(state["investigation_history"])
         
@@ -410,6 +413,7 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
 
         llm_input = {
             "steps": state["steps"],
+            "log_clues": state["log_clues"],
             "investigation_history": history_text,
             "format_instructions": base_parser.get_format_instructions() 
         }
@@ -546,7 +550,7 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
                     for tc in msg.tool_calls:
                         history_tool_calls[tc['id']] = tc
             
-            # 如果是工具回傳的結果 【修正在這裡：將給 Engineer 看的內容截斷為 500 字元】
+            # 如果是工具回傳的結果
             elif isinstance(msg, ToolMessage):
                 # 先貼上工具呼叫資訊
                 tc = history_tool_calls.get(msg.tool_call_id)
