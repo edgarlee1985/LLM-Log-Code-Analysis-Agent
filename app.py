@@ -47,8 +47,8 @@ class SingleBugReport(BaseModel):
 
 # 定義預期的 Log 結構
 class TraceFrame(BaseModel):
-    file_name: str = Field(description="Log 中提到的檔案路徑或名稱")
-    line_number: int = Field(description="對應的行號")
+    file_name: str = Field(default="", description="Log 中提到的檔案路徑或名稱")
+    line_number: int = Field(default=-1, description="對應的行號")
 
 class LogClues(BaseModel):
     error_type: Optional[str] = Field(default=None, description="明確的錯誤類型...")
@@ -678,26 +678,22 @@ def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
     return result["output"]
 
 def enrich_trace_with_code(clues: LogClues, tools) -> str:
-    """根據解析出的軌跡，從 AST 與 Reference 字典中萃取：檔案、Function、行號以及使用的變數"""
+    """根據解析出的軌跡，直接從 AOT 計算好的 AST 字典中讀取：檔案、Function、行號以及使用的成員函數、成員變數"""
     if not clues.execution_trace:
-        return clues.model_dump_json(indent=2)
+        enriched_info = clues.model_dump()
+        enriched_info.pop("execution_trace", None)
+        return json.dumps(enriched_info, ensure_ascii=False, indent=2)
         
     # 取得路徑設定
     repo_dir = config["Default"]["RepoDir"]
     db_dir = config["Default"]["FAISSDBDir"]
     bounds_path = os.path.join(db_dir, "symbol_bounds.json")
-    refs_path = os.path.join(db_dir, "symbol_references.json")
     
-    # 1. 預先讀取兩個字典
+    # 只需要讀取單一的 bounds 字典
     ast_data = {}
     if os.path.exists(bounds_path):
         with open(bounds_path, "r", encoding="utf-8") as f:
             ast_data = json.load(f)
-            
-    refs_data = {}
-    if os.path.exists(refs_path):
-        with open(refs_path, "r", encoding="utf-8") as f:
-            refs_data = json.load(f)
             
     trace_context = []
     # 只取前三層軌跡
@@ -705,63 +701,39 @@ def enrich_trace_with_code(clues: LogClues, tools) -> str:
         # 利用 resolve_best_repo_path 找真實路徑
         actual_path = resolve_best_repo_path(frame.file_name, repo_dir, IGNORE_DIRS)
         func_name = "Unknown"
-        func_bounds = None
-        used_symbols = set() # 存放該函數內使用的變數/符號
+        m_data_str = "無"
+        m_func_str = "無"
         
         if actual_path:
             target_entities = None
-            
-            # (A) 從 bounds 字典找出對應檔案的實體
             for dict_file_path, entities in ast_data.items():
                 if os.path.normpath(dict_file_path) == os.path.normpath(actual_path):
                     target_entities = entities
                     break
                     
             if target_entities:
-                matched_bounds = None
-                # 優先找函數 (範圍最小的)
                 for fname, bounds in target_entities.get("functions", {}).items():
                     if bounds["start_line"] <= frame.line_number <= bounds["end_line"]:
-                        if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
-                            func_name = fname
-                            matched_bounds = bounds
-                            
-                # 沒找到函數則找類別
-                if not matched_bounds:
-                    for cname, bounds in target_entities.get("classes", {}).items():
-                        if bounds["start_line"] <= frame.line_number <= bounds["end_line"]:
-                            if not matched_bounds or (bounds["end_line"] - bounds["start_line"] < matched_bounds["end_line"] - matched_bounds["start_line"]):
-                                func_name = cname
-                                matched_bounds = bounds
-                                
-                func_bounds = matched_bounds
-                
-            # (B) 如果有找到函數範圍，去 refs 字典撈出裡面用到的所有符號
-            if func_bounds and refs_data:
-                start_l = func_bounds["start_line"]
-                end_l = func_bounds["end_line"]
-                
-                # 遍歷所有的 Reference 尋找落在這份檔案與這個行號區間的符號
-                for symbol, file_refs in refs_data.items():
-                    # 尋找這個符號是否有在我們目前的實際檔案路徑中被呼叫
-                    for ref_file_path, lines in file_refs.items():
-                        if os.path.normpath(ref_file_path) == os.path.normpath(actual_path):
-                            # 檢查是否有行號落在該函數 (start_l ~ end_l) 範圍內
-                            if any(start_l <= l <= end_l for l in lines):
-                                # 過濾掉自己 (不要把函數名稱自己也算進去)
-                                if symbol != func_name:
-                                    used_symbols.add(symbol)
-                            break
-                            
-        # 組裝精簡版的軌跡字串
-        symbol_str = ", ".join(sorted(list(used_symbols))) if used_symbols else "無/無法辨識"
-        trace_info = (f"🔻 【軌跡 {i+1}】 檔案: {frame.file_name} | Function: {func_name} | 行號: {frame.line_number}\n"
-                      f"    ↳ 內部參照符號/變數: {symbol_str}")
+                        func_name = fname
+                        
+                        # 👉 直接讀取預先算好的陣列
+                        m_data = bounds.get("used_member_data", [])
+                        m_funcs = bounds.get("used_member_functions", [])
+                        
+                        m_data_str = ", ".join(m_data) if m_data else "無"
+                        m_func_str = ", ".join(m_funcs) if m_funcs else "無"
+                        break # 找到範圍最小的函數後跳出
+                        
+        trace_info = (f"【軌跡 {i+1}】 檔案: {frame.file_name} | Function: {func_name} | 行號: {frame.line_number}\n"
+                      f"內部參照成員變數: {m_data_str}\n"
+                      f"內部參照成員函數: {m_func_str}")
         trace_context.append(trace_info)
             
     # 將結果合併回 JSON
     enriched_info = clues.model_dump()
     enriched_info["enriched_code_trace"] = "\n".join(trace_context)
+    enriched_info.pop("execution_trace", None)
+    
     return json.dumps(enriched_info, ensure_ascii=False, indent=2)
 
 # ==========================================
@@ -780,7 +752,7 @@ if __name__ == "__main__":
 
     llm_json = ChatOllama(model=config["Default"]["ModelName"],
                         temperature=0.0,
-                        seed=50, repeat_penalty=1.0,
+                        seed=50, repeat_penalty=1.2,
                         num_ctx=16384,
                         num_predict=4096,
                         format="json", 

@@ -311,10 +311,16 @@ def build_global_dependency_tree(all_chunks: list[Document], save_dir: str):
     print(f"完成！相依樹已儲存至: {tree_path}")
     return dependency_graph
 
-def build_symbol_bounds_index(all_chunks: list[Document], save_dir: str):
-    """掃描所有 AST Chunk，建立【檔案路徑 -> 實體名稱 -> 行號邊界】的快速查詢字典"""
-    print("正在建構 AST 邊界查詢字典 (Symbol Bounds Index)...")
+def build_symbol_bounds_index(all_chunks: list[Document], save_dir: str, dependency_graph: dict = None, reference_graph: dict = None):
+    """
+    掃描所有 AST Chunk，建立【檔案路徑 -> 實體名稱 -> 行號邊界】的快速查詢字典。
+    (修改：接收前兩次 Pass 建立的字典，在此直接計算出使用的 Member Data/Func)
+    """
+    print("正在建構 AST 邊界查詢字典 (並進行 AOT 變數分析)...")
     symbol_bounds_index = {}
+    
+    if dependency_graph is None: dependency_graph = {}
+    if reference_graph is None: reference_graph = {}
     
     for chunk in all_chunks:
         meta = chunk.metadata
@@ -342,11 +348,61 @@ def build_symbol_bounds_index(all_chunks: list[Document], save_dir: str):
             func_signature = chunk.page_content.split('\n')[0].strip()
             # 取括號前的名稱作為簡略 Key
             func_name = func_signature.split('(')[0].split(' ')[-1].strip()
+            
             if func_name:
+                start_line = meta.get("start_line")
+                end_line = meta.get("end_line")
+                
+                # --- 核心邏輯：AOT 預先計算 ---
+                used_symbols = set()
+                # 1. 找出這個函數範圍內用到的所有符號
+                for sym, file_refs in reference_graph.items():
+                    if source in file_refs:
+                        if any(start_line <= l <= end_line for l in file_refs[source]):
+                            used_symbols.add(sym)
+                            
+                # 2. 推斷該函數所屬的 Class
+                parent_class = None
+                pure_func_name = func_name
+                # C++ 實作常見寫法 ClassName::FunctionName
+                if "::" in func_name:
+                    parts = func_name.split("::")
+                    parent_class = parts[-2]
+                    pure_func_name = parts[-1]
+                else:
+                    # 嘗試從檔案歸屬推斷
+                    for cls, data in dependency_graph.items():
+                        if any(os.path.normpath(s) == os.path.normpath(source) for s in data.get("source_files", [])):
+                            parent_class = cls
+                            break
+                            
+                # 3. 進行交集比對
+                member_data = set()
+                member_funcs = set()
+                
+                if parent_class and parent_class in dependency_graph:
+                    cls_data = dependency_graph[parent_class]
+                    for comp in cls_data.get("composes", []):
+                        if comp.get("name") in used_symbols:
+                            member_data.add(comp.get("name"))
+                            
+                    for method in cls_data.get("methods", []):
+                        m_name = method.get("name")
+                        if m_name in used_symbols and m_name != pure_func_name:
+                            member_funcs.add(m_name)
+                            
+                # 4. 防呆：C++ m_ 開頭變數慣例
+                for sym in used_symbols:
+                    if sym.startswith("m_") and sym not in member_data:
+                        member_data.add(sym)
+
+                # 5. 寫入 JSON 結構
                 symbol_bounds_index[source]["functions"][func_name] = {
-                    "start_line": meta.get("start_line"),
-                    "end_line": meta.get("end_line"),
-                    "signature": func_signature
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "signature": func_signature,
+                    "used_member_data": sorted(list(member_data)),       # 👉 直接存入
+                    "used_member_functions": sorted(list(member_funcs))  # 👉 直接存入
                 }
 
     meta_path = os.path.join(save_dir, "symbol_bounds.json")
@@ -354,7 +410,7 @@ def build_symbol_bounds_index(all_chunks: list[Document], save_dir: str):
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(symbol_bounds_index, f, indent=4, ensure_ascii=False)
         
-    print(f"完成！AST 邊界字典已儲存至: {meta_path}")
+    print(f"完成！AST 邊界字典 (含 AOT 變數分析) 已儲存至: {meta_path}")
 
 def build_symbol_references(documents: list, save_dir: str):
     """
@@ -362,10 +418,9 @@ def build_symbol_references(documents: list, save_dir: str):
     記錄每個變數、函數在哪些檔案的哪些行數被使用。
     """
     print("正在建構 Symbol Reference 字典 (Symbol References)...")
-    reference_graph = {} # 格式: { symbol_name: { source_path: set(line_numbers) } }
+    reference_graph = {} 
 
     for doc in documents:
-        # 統一將路徑斜線轉換為正斜線
         source_path = doc.metadata.get("source", "")
         ext = os.path.splitext(source_path)[1].lower()
         
@@ -411,6 +466,7 @@ def build_symbol_references(documents: list, save_dir: str):
         json.dump(reference_graph, f, indent=4, ensure_ascii=False)
         
     print(f"完成！Symbol Reference 字典已儲存至: {ref_path}")
+    return reference_graph # 回傳字典供後續 AOT 計算使用
 
 def get_files_from_repo(repo_path: str, ignore_dirs: set[str]):
     """走訪資料夾，取得所有符合條件的檔案路徑"""
@@ -427,6 +483,7 @@ def get_files_from_repo(repo_path: str, ignore_dirs: set[str]):
     return file_paths
 
 def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str], embeddings):
+    """串接資料流"""
     print(f"開始掃描資料夾: {repo_path}")
     file_paths = get_files_from_repo(repo_path, ignore_dirs)
     
@@ -441,18 +498,15 @@ def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str],
         except Exception as e:
             print(f"讀取檔案失敗 {path}: {e}")
 
-    build_symbol_references(documents, db_dir)
+    # 接收第一階段回傳的 reference_graph
+    reference_graph = build_symbol_references(documents, db_dir)
 
     print(f"共讀取了 {len(documents)} 個檔案。開始動態切塊...")
 
     # 動態切割文本 (Dynamic Text Splitting)
     all_chunks = []
-    
     # 建立一個通用的 Fallback/二次切塊 Splitter
-    fallback_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500, 
-        chunk_overlap=200
-    )
+    fallback_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     
     for doc in documents:
         # 1. 嘗試使用 AST 切塊
@@ -483,8 +537,11 @@ def gen_faii_index_from_path(repo_path: str, db_dir: str, ignore_dirs: set[str],
     print(f"所有檔案已切割成 {len(all_chunks)} 個區塊 (Chunks)。")
 
     # 呼叫建立樹狀圖的函數
-    build_global_dependency_tree(all_chunks, db_dir)
-    build_symbol_bounds_index(all_chunks, db_dir)
+    # 接收第二階段回傳的 dependency_graph
+    dependency_graph = build_global_dependency_tree(all_chunks, db_dir)
+    
+    # 終極階段：將兩個 Graph 傳入進行交集運算並寫入 JSON
+    build_symbol_bounds_index(all_chunks, db_dir, dependency_graph, reference_graph)
     
     # 建立 FAISS 向量資料庫
     print("正在建立 FAISS 向量資料庫 (這可能需要幾分鐘的時間)...")
