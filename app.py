@@ -824,6 +824,12 @@ if __name__ == "__main__":
     # 建立 Graph
     debugger_app = build_debugging_graph(llm_json, llm_text, tools)
 
+    # ===== 初始化統計變數 =====
+    total_bugs = len(bug_reports)
+    resolved_bugs_count = 0
+    bug_statistics = []
+    # =================================
+
     for report in bug_reports:
         bug_start_time = time.perf_counter() # 記錄 bug 開始時間
         token_tracker.reset_current()
@@ -854,8 +860,23 @@ if __name__ == "__main__":
         # 執行 Graph 迴圈
         # .invoke 會一直跑到抵達 END 節點才會回傳最終的 State
         final_state = debugger_app.invoke(initial_state)
-        print("\n🏆 --- 最終 Bug 報告 --- 🏆")
+        print("\n --- 最終 Bug 報告 --- ")
         print(final_state.get("final_report", "無法在迭代次數內找到完整的 Root Cause。以下是目前分析：\n" + final_state.get("missing_information", "")))
+
+        # ===== 收集此 Bug 的迭代與解決狀態 =====
+        current_is_resolved = final_state.get("is_resolved", False)
+        current_iterations = final_state.get("iterations", 1)
+        
+        if current_is_resolved:
+            resolved_bugs_count += 1
+            
+        bug_statistics.append({
+            "bug_id": report.bug_id,
+            "is_resolved": current_is_resolved,
+            "iterations": current_iterations,
+            "fix_count": final_state.get("fix_count", 0)
+        })
+        # ===============================================
         
         bug_end_time = time.perf_counter() # 記錄 bug 結束時間
         bug_total_time = bug_end_time - bug_start_time
@@ -883,3 +904,17 @@ if __name__ == "__main__":
     print(f"總輸入量 : {token_tracker.all_prompt_tokens}")
     print(f"總生成量 : {token_tracker.all_completion_tokens}")
     print(f"全局總累計用量: {token_tracker.all_total_tokens}")
+
+    # ===== 印出整體的解蟲與迭代統計報告 =====
+    print("\n📈 --- 整體解蟲統計報告 --- 📈")
+    print(f"總 Bug 數量: {total_bugs}")
+    print(f"成功解決數量: {resolved_bugs_count}")
+    
+    success_rate = (resolved_bugs_count / total_bugs) * 100 if total_bugs > 0 else 0
+    print(f"整體解決率: {success_rate:.2f}%\n")
+    
+    print("--- 每條 Bug 的迭代詳細資訊 ---")
+    for stat in bug_statistics:
+        status_icon = "✅ 成功" if stat["is_resolved"] else "❌ 失敗"
+        print(f"[{stat['bug_id']}] 狀態: {status_icon} | 總迭代次數: {stat['iterations']} 次 | 觸發 JSON 修復: {stat['fix_count']} 次")
+    print("================================")
