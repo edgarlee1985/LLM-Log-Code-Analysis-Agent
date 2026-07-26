@@ -240,79 +240,107 @@ def exact_keyword_search(keyword: str, file_extension: str = "") -> str:
         return f"找不到包含精確關鍵字 '{keyword}' 的程式碼。"
 
 @tool
-def read_symbol_code(file_path_hint: str, target_symbol: str) -> str:
+def read_symbol_code(target_symbol: str, file_path_hint: str = "") -> str:
     """
-    【功能】閱讀特定「類別 (Class)」或「函數/方法 (Function/Method)」的完整內部實作程式碼。
+    【功能】在全專案中搜尋特定「類別 (Class)」或「函數/方法 (Function/Method)」的完整內部實作程式碼。
     
     【使用時機】
-    - 當你已經精確掌握某個「類別 (Class)」或「函數/方法 (Function/Method)」的名稱，且需要閱讀其完整的內部實作程式碼時使用。
-    - 如果在指定的 Class 檔案中找不到該 target_symbol (例如方法不存在)，通常是因為方法是繼承來的，此時請改用 `analyze_class_architecture` 查詢該 Class 的父類別。
+    - 當你需要閱讀特定類別或函數的內部實作，且已經精確掌握該符號名稱時。
+    - 不論是否知道該符號所在的檔案名稱皆可使用。
     
     【禁用時機 (絕對不要用)】
     - ❌ 本工具無法搜尋「變數 (Variable)」。
     - ❌ 若要追蹤變數在哪裡被呼叫或修改，請改用 `find_symbol_references`。
-    - ❌ 嚴禁為了尋找特定成員變數而呼叫 `analyze_class_architecture`，這會浪費大量 Token！
-    - ❌ 絕對不能傳入一段 Log 句子或口語文字。
     
     【輸入規範】
-    - file_path_hint 必須是絕對路徑或相對路徑，不可以只有純檔名，系統會自動進行智慧比對。
-    - target_symbol 必須是精確的類別或函數名稱。
+    - target_symbol 必須是精確的類別或函數名稱 (例如 'hardwareMode' 或 'EdgeDevice')。
+    - file_path_hint 為選填，若提供則只會搜尋該檔案；若留空則全域搜尋。
     """
-    print(f"read_symbol_code, file_path_hint = {file_path_hint}, target_symbol = {target_symbol}")
+    print(f"read_symbol_code, target_symbol = {target_symbol}, file_path_hint = {file_path_hint}")
     
-    # 1. 先利用已有的智慧比對，找出真實的檔案路徑
-    actual_path = resolve_best_repo_path(file_path_hint, _tool_env["repo_dir"], _tool_env["ignore_dirs"])
-    if not actual_path:
-        return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
-
-    # 2. 讀取 AST 字典
     ast_data = _tool_env["symbol_bounds"]
     if not ast_data:
         return "系統錯誤： symbol_bounds 字典未成功載入。"
-        
-    # 3. 找出對應檔案的 AST 實體 (注意路徑格式的比對)
-    target_entities = None
-    target_file_key = None
+
+    # 若有提供檔案提示，先解析出真實路徑作為過濾條件
+    target_actual_path = None
+    if file_path_hint:
+        target_actual_path = resolve_best_repo_path(file_path_hint, _tool_env["repo_dir"], _tool_env["ignore_dirs"])
+        target_actual_path = os.path.normpath(target_actual_path) if target_actual_path else None
+
+    matched_results = []
+
+    # 1. 全域掃描 AST 字典尋找相符的符號
     for dict_file_path, entities in ast_data.items():
-        # 使用 os.path.normpath 確保斜線與反斜線的格式統一，避免比對失敗
-        if os.path.normpath(dict_file_path) == os.path.normpath(actual_path):
-            target_entities = entities
-            target_file_key = dict_file_path
-            break
+        # 如果有指定檔案，且路徑不匹配，則跳過
+        if target_actual_path and os.path.normpath(dict_file_path) != target_actual_path:
+            continue
             
-    if not target_entities:
-        return f"讀取失敗：在 AST 字典中沒有 '{file_path_hint}' 的解析紀錄。"
+        # 找類別
+        for cls_name, bounds in entities.get("classes", {}).items():
+            if target_symbol.lower() in cls_name.lower():
+                matched_results.append({
+                    "file": dict_file_path,
+                    "type": f"Class",
+                    "bounds": bounds
+                })
+                
+        # 找函數
+        for func_name, bounds in entities.get("functions", {}).items():
+            if target_symbol.lower() in func_name.lower():
+                matched_results.append({
+                    "file": dict_file_path,
+                    "type": f"Function",
+                    "bounds": bounds
+                })
 
-    # 4. 收集「所有」符合的邊界，解決同名或多載 (Overloading) 的問題
-    matched_bounds = []
-    
-    # 找類別
-    for cls_name, bounds in target_entities.get("classes", {}).items():
-        if target_symbol.lower() in cls_name.lower():
-            matched_bounds.append((f"Class: {cls_name}", bounds["start_line"], bounds["end_line"]))
-            
-    # 找函數
-    for func_name, bounds in target_entities.get("functions", {}).items():
-        if target_symbol.lower() in func_name.lower():
-            matched_bounds.append((f"Function: {func_name}", bounds["start_line"], bounds["end_line"]))
+    if not matched_results:
+        scope_msg = f"檔案 '{file_path_hint}'" if file_path_hint else "全專案"
+        return f"讀取失敗：在 {scope_msg} 中找不到名稱包含 '{target_symbol}' 的函數或類別。"
 
-    if not matched_bounds:
-        return f"讀取失敗：在檔案 '{file_path_hint}' 中找不到名稱包含 '{target_symbol}' 的函數或類別。"
+    # 2. 限制回傳數量避免 Context Window 爆掉
+    MAX_MATCHES = 5
+    results_str = [f"🔍 共找到 {len(matched_results)} 個相符符號 (最多顯示 {MAX_MATCHES} 個)：\n"]
 
-    # 5. 去讀取真實檔案並擷取所有相符片段
-    try:
-        with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
-            lines = f.readlines()
-            
-        results = []
-        for symbol_desc, start_line, end_line in matched_bounds:
-            snippet = "".join(lines[start_line-1:end_line])
-            results.append(f"【{symbol_desc}】(行號 {start_line}-{end_line})\n{snippet}")
-            
-        return f"在檔案 '{target_file_key}' 中找到 {len(matched_bounds)} 個相符的符號：\n\n" + "\n---\n\n".join(results)
+    # 3. 根據收集到的邊界，實際去讀取檔案內容
+    for match in matched_results[:MAX_MATCHES]:
+        file_path = match["file"]
+        sym_type = match["type"]
+        bounds = match["bounds"]
+        start_line = bounds["start_line"]
+        end_line = bounds["end_line"]
         
-    except Exception as e:
-        return f"讀取檔案失敗: {e}"
+        actual_path = resolve_best_repo_path(file_path, _tool_env["repo_dir"], _tool_env["ignore_dirs"])
+        
+        if not actual_path or not os.path.exists(actual_path):
+            results_str.append(f"【{sym_type}】(位於 {file_path})\n-> 讀取檔案失敗：找不到實體檔案。")
+            continue
+            
+        try:
+            with open(actual_path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+                
+            start_idx = max(0, start_line - 1)
+            end_idx = min(len(lines), end_line)
+            snippet = "".join(lines[start_idx:end_idx])
+            
+            # 從 bounds 字典中取出預先分析好的內部參照變數 (只有 Function 會有此欄位)
+            used_data = bounds.get("used_member_data", [])
+            hint_str = ""
+            if used_data:
+                hint_str = "\n--- 💡 智慧提示 (內部參照變數型別) ---\n" + "\n".join([f"- {d}" for d in used_data])
+
+            # 將 hint_str 附加在原本的輸出結果後方
+            results_str.append(f"【{sym_type}】(位於檔案 '{file_path}', 行號 {start_line}-{end_line})\n{snippet}{hint_str}")
+            
+        except Exception as e:
+            results_str.append(f"【{sym_type}】(位於檔案 '{file_path}')\n-> 讀取檔案內容失敗: {e}")
+
+    # 4. 若超過限制，給予 LLM 提示
+    if len(matched_results) > MAX_MATCHES:
+        results_str.append(f"\n... (還有 {len(matched_results) - MAX_MATCHES} 個同名結果被隱藏，請考慮加上 file_path_hint 來縮小範圍)")
+
+    return "\n---\n\n".join(results_str)
 
 @tool
 def read_function_by_line(file_path_hint: str, line_number: int) -> str:
@@ -393,10 +421,16 @@ def read_function_by_line(file_path_hint: str, line_number: int) -> str:
         
         snippet = "".join(lines[start_idx:end_idx])
         
+        # 從 matched_bounds 中提取 AOT 分析好的變數資訊
+        used_data = matched_bounds.get("used_member_data", [])
+        used_data_str = "\n".join([f"- {d}" for d in used_data]) if used_data else "- 無"
+        
         return (
             f"🎯 成功於第 {line_number} 行定位到 【{matched_symbol_type}】\n"
             f"以下為完整的落點區塊 (行號 {start_line}-{end_line}):\n\n"
-            f"{snippet}"
+            f"{snippet}\n"
+            f"--- 💡 智慧提示 (內部參照變數型別) ---\n"
+            f"{used_data_str}"
         )
         
     except Exception as e:
