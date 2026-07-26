@@ -321,9 +321,31 @@ def parse_report(llm, bug_report: SingleBugReport) -> LogClues:
     
     # 結合 LCEL 與 Structured Output 確保回傳 Pydantic 格式
     parser_chain = prompt | llm.with_structured_output(LogClues)
+    try:
+        logclues = parser_chain.invoke({"raw_log": combined_logs})
+    except (Exception, ValidationError) as e:
+        print(f"解析 JSON 或生成失敗: {e}")
+        # 將原始 Log 進行截斷 (避免 Context Window 爆掉，取最後 1500 字元，因為錯誤通常在最下面)
+        log_snippet = combined_logs[-1500:] if len(combined_logs) > 1500 else combined_logs
+        
+        # 將原始 Log 直接嵌入 semantic_issue 傳遞給 Engineer
+        fallback_semantic = (
+            "【系統警告】：LLM 結構化解析 Log 失敗。\n"
+            "【探員行動建議】：請直接閱讀以下擷取的原始 Log，找出任何可疑的 '關鍵字'、'函數' 或 '檔案名稱'，"
+            "並利用 exact_keyword_search 或 semantic_code_search 展開調查。\n\n"
+            f"--- 原始 Log 節錄 ---\n{log_snippet}"
+        )
+        logclues = LogClues(
+            error_type="LogParseError",
+            file_name=None,
+            line_number=-1,
+            semantic_issue= fallback_semantic,
+            execution_trace=[] 
+        )
+
     
     # 將組合好的 logs 字串傳遞給 prompt 中的 {raw_log} 變數
-    return parser_chain.invoke({"raw_log": combined_logs})
+    return logclues
 
 # ==========================================
 # LangGraph Workflow 建立 (使用閉包封裝 LLM 與 Tools)
