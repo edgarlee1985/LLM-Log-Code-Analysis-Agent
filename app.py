@@ -73,7 +73,7 @@ class DetectiveCommand(BaseModel):
                     "1. 'TRACE_STATE': 追蹤特定「變數」或「屬性」的讀取與修改軌跡。\n"
                     "2. 'INSPECT_LOGIC': 閱讀已知「函數」、「類別」或「具體行號」的內部實作邏輯。\n"
                     "3. 'SEARCH_CONCEPT': 透過報錯 Log、字串或口語描述，在全域尋找異常落點。\n"
-                    "4. 'ANALYZE_STRUCTURE': 調查類別的「繼承關係 (父子類別)」或「成員架構」。"
+                    "4. 'ANALYZE_STRUCTURE': 【警告】僅限調查 OOP 繼承關係、虛擬函數覆寫，或尋找【未知成員變數名稱】時使用。嚴禁為了解決一般邏輯錯誤而選用此項！"
     )
     target_value: str = Field(
         default="", 
@@ -208,10 +208,11 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 你目前正在與一位「檢索探員 (Detective)」合作。探員配備了多種檢索工具，你負責提供假設並指揮他。
 
 【🎯 核心指揮戰略 (Command Strategy)】
-1. 巨觀探索 (Macro)：當只有語意線索時，請下令使用 `semantic_code_search` 或 `exact_keyword_search` 找出相關邏輯落點。
-2. 函數與架構解析 (Micro)：當你已經知道具體的檔案、函數或類別名稱時，請明確指示探員使用 `read_function_by_line`、`read_symbol_code` 或 `analyze_class_architecture` 獲取完整實作。
-3. 變數與狀態追蹤 (State Tracking)：當你懷疑某個「變數」或「狀態」不同步時，這是最關鍵的時刻！請【絕對優先】下令使用 `find_symbol_references` 來追蹤該變數在哪裡被讀取或修改，切勿要求探員去盲目閱讀大量無關的函數。
-4. 推進邏輯：如果探員上一輪回報某個方向失敗，下一輪絕對不可以叫探員查一樣的地方。指令必須越來越微觀。
+1. 巨觀探索 (Macro)：當只有語意線索時，請下令使用 semantic_code_search 或 exact_keyword_search 找出相關邏輯落點。
+2. 函數邏輯解析 (Micro)：當你已經知道具體的檔案、函數或類別名稱，且需要閱讀「內部執行邏輯」時，請明確指示探員使用 read_function_by_line 或 read_symbol_code。
+3. 變數與狀態追蹤 (State Tracking)：當你懷疑某個「變數」或「狀態」不同步時，請【絕對優先】下令使用 find_symbol_references 來追蹤該變數在哪裡被讀取或修改，切勿要求探員去盲目閱讀大量無關的函數。
+1. 物件導向架構分析 (OOP Analysis)：【絕對禁止】將此作為常規的程式碼讀取手段！只有當你懷疑 Bug 與「繼承關係 (Inheritance)」、「多型 (Polymorphism)」、「找不到父類別方法」，或是極度需要一覽「所有成員變數清單」時，才能下令使用 analyze_class_architecture。
+5. 推進邏輯：如果探員上一輪回報某個方向失敗，下一輪絕對不可以叫探員查一樣的地方。指令必須越來越微觀。
 
 【💡 工作模式：假設驅動 (Hypothesis-Driven)】
 1. 觀察：仔細閱讀使用者的 Bug 重現步驟與原始系統 Log。
