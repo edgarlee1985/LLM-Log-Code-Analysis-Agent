@@ -82,7 +82,7 @@ def extract_class_dependencies(class_node, source_bytes: bytes):
                     if base_name and c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'identifier']:
                         dependencies["inherits"].add(base_name)
                         
-        # --- 新增：捕捉類別方法與成員變數 ---
+        # --- 捕捉類別方法與成員變數 ---
         elif node.type in ['field_declaration', 'function_definition']:
             is_function = False
             method_name = None
@@ -114,11 +114,29 @@ def extract_class_dependencies(class_node, source_bytes: bytes):
                     analyze_member(c)
                     
             analyze_member(node)
-            
+
+            signature = method_name
+            if is_function:
+                body_node = None
+                for c in node.children:
+                    if c.type == 'compound_statement':
+                        body_node = c
+                        break
+                
+                if body_node:
+                    # 擷取從函數起始點到大括號前的所有文字
+                    sig_bytes = source_bytes[node.start_byte : body_node.start_byte]
+                    signature = sig_bytes.decode('utf-8').strip()
+                else:
+                    # 當沒有大括號 (如標頭檔純宣告) 時，直接擷取整個節點內容並去除分號
+                    sig_bytes = source_bytes[node.start_byte : node.end_byte]
+                    signature = sig_bytes.decode('utf-8').strip().rstrip(';')
+
             # 如果確認是函數，加入 methods 列表
             if is_function and method_name:
                 dependencies["methods"].append({
                     "name": method_name,
+                    "signature": signature,
                     "is_virtual": is_virtual,
                     "is_override": is_override
                 })
@@ -126,25 +144,40 @@ def extract_class_dependencies(class_node, source_bytes: bytes):
             elif node.type == 'field_declaration' and not is_function:
                 field_type = None
                 field_name = None
+                is_pointer = False  # 用來追蹤是否含有指標宣告
                 
                 for c in node.children:
                     if c.type in ['type_identifier', 'template_type', 'qualified_identifier', 'primitive_type']:
                         field_type = source_bytes[c.start_byte:c.end_byte].decode('utf-8')
                     else:
-                        def find_identifier(n):
+                        def find_identifier_and_pointer(n):
+                            nonlocal is_pointer
+                            if n.type == 'pointer_declarator':
+                                is_pointer = True
                             if n.type in ['field_identifier', 'identifier']:
                                 return source_bytes[n.start_byte:n.end_byte].decode('utf-8')
                             for child in n.children:
-                                res = find_identifier(child)
+                                res = find_identifier_and_pointer(child)
                                 if res: return res
                             return None
                         
-                        found_name = find_identifier(c)
+                        found_name = find_identifier_and_pointer(c)
                         if found_name:
                             field_name = found_name
 
+                # 額外檢查整行宣告中是否包含 pointer_declarator
+                def check_pointer(n):
+                    if n.type == 'pointer_declarator':
+                        return True
+                    return any(check_pointer(child) for child in n.children)
+                
+                if check_pointer(node):
+                    is_pointer = True
+
                 if field_type:
-                    dependencies["composes"].add((field_type, field_name or "unknown"))
+                    # 如果是指標，自動在型別後方補上 '*'
+                    final_type = f"{field_type}*" if is_pointer else field_type
+                    dependencies["composes"].add((final_type, field_name or "unknown"))
         
         # 繼續往下走訪其他節點
         for child in node.children:
@@ -279,16 +312,16 @@ def build_global_dependency_tree(all_chunks: list[Document], save_dir: str):
             new_methods = meta.get("methods", [])
             if new_methods:
                 current_methods = {
-                    m["name"]: m for m in dependency_graph[cls_name].get("methods", [])
+                    m["signature"]: m for m in dependency_graph[cls_name].get("methods", [])
                 }
                 for m in new_methods:
-                    name = m["name"]
-                    if name not in current_methods:
-                        current_methods[name] = m
+                    sig = m["signature"]
+                    if sig not in current_methods:
+                        current_methods[sig] = m
                     else:
                         # 只要有任何一個宣告帶有 virtual 或 override，就標記為 True
-                        current_methods[name]["is_virtual"] |= m["is_virtual"]
-                        current_methods[name]["is_override"] |= m["is_override"]
+                        current_methods[sig]["is_virtual"] |= m["is_virtual"]
+                        current_methods[sig]["is_override"] |= m["is_override"]
                 
                 dependency_graph[cls_name]["methods"] = list(current_methods.values())
 
@@ -377,32 +410,52 @@ def build_symbol_bounds_index(all_chunks: list[Document], save_dir: str, depende
                             break
                             
                 # 3. 進行交集比對
-                member_data = set()
-                member_funcs = set()
+                member_data_formatted = set() # 用來存最終要輸出的 "型別 + 名稱"
+                matched_data_names = set()    # 用來給防呆機制檢查的純名稱
+                
+                member_funcs_formatted = set()
                 
                 if parent_class and parent_class in dependency_graph:
                     cls_data = dependency_graph[parent_class]
+                    
+                    # --- 處理成員變數 ---
                     for comp in cls_data.get("composes", []):
-                        if comp.get("name") in used_symbols:
-                            member_data.add(comp.get("name"))
+                        comp_name = comp.get("name")
+                        if comp_name in used_symbols:
+                            comp_type = comp.get("type", "")
+                            # 組合出 "型別 名稱"
+                            member_data_formatted.add(f"{comp_type} {comp_name}".strip())
+                            matched_data_names.add(comp_name)
                             
+                    # --- 處理成員函數 ---
                     for method in cls_data.get("methods", []):
                         m_name = method.get("name")
                         if m_name in used_symbols and m_name != pure_func_name:
-                            member_funcs.add(m_name)
+                            # 優先使用 extract_class_dependencies 抓取的 signature
+                            sig = method.get("signature")
+                            if not sig:
+                                # 若沒抓取，則組合名稱與 virtual/override 標籤
+                                tags = []
+                                if method.get("is_virtual"): tags.append("virtual")
+                                if method.get("is_override"): tags.append("override")
+                                tag_str = f" [{', '.join(tags)}]" if tags else ""
+                                sig = f"{m_name}(){tag_str}"
                             
+                            member_funcs_formatted.add(sig)
+
                 # 4. 防呆：C++ m_ 開頭變數慣例
                 for sym in used_symbols:
-                    if sym.startswith("m_") and sym not in member_data:
-                        member_data.add(sym)
+                    # 改用 matched_data_names 來比對，就不會引發重複加入
+                    if sym.startswith("m_") and sym not in matched_data_names:
+                        member_data_formatted.add(sym)
 
                 # 5. 寫入 JSON 結構
                 symbol_bounds_index[source]["functions"][func_name] = {
                     "start_line": start_line,
                     "end_line": end_line,
                     "signature": func_signature,
-                    "used_member_data": sorted(list(member_data)),       # 👉 直接存入
-                    "used_member_functions": sorted(list(member_funcs))  # 👉 直接存入
+                    "used_member_data": sorted(list(member_data_formatted)),      # 寫入無重複格式化的資料
+                    "used_member_functions": sorted(list(member_funcs_formatted)) # 寫入帶 Signature 的函數
                 }
 
     meta_path = os.path.join(save_dir, "symbol_bounds.json")
