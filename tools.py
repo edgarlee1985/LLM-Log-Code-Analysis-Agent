@@ -9,7 +9,10 @@ _tool_env = {
     "repo_dir": "",
     "db_dir": "",
     "ignore_dirs": set(),
-    "ensemble_retriever": None
+    "ensemble_retriever": None,
+    "symbol_bounds": {},
+    "class_tree": {},
+    "symbol_refs": {}
 }
 
 # 2. 提供一個「一次性初始化」的函數
@@ -19,6 +22,29 @@ def init_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemble_retri
     _tool_env["db_dir"] = db_dir
     _tool_env["ignore_dirs"] = ignore_dirs
     _tool_env["ensemble_retriever"] = ensemble_retriever
+    # 一次性載入三個字典檔案到記憶體
+    bounds_path = os.path.join(db_dir, "symbol_bounds.json")
+    if os.path.exists(bounds_path):
+        with open(bounds_path, "r", encoding="utf-8") as f:
+            _tool_env["symbol_bounds"] = json.load(f)
+
+    tree_path = os.path.join(db_dir, "class_dependency_tree.json")
+    if os.path.exists(tree_path):
+        with open(tree_path, "r", encoding="utf-8") as f:
+            _tool_env["class_tree"] = json.load(f)
+
+    refs_path = os.path.join(db_dir, "symbol_references.json")
+    if os.path.exists(refs_path):
+        with open(refs_path, "r", encoding="utf-8") as f:
+            _tool_env["symbol_refs"] = json.load(f)
+
+def get_ast_dictionaries() -> dict:
+    """提供唯讀的 AST 字典供外部模組 (如 app.py) 查詢，保護內部狀態不被竄改"""
+    return {
+        "symbol_bounds": _tool_env.get("symbol_bounds", {}),
+        "class_tree": _tool_env.get("class_tree", {}),
+        "symbol_refs": _tool_env.get("symbol_refs", {})
+    }
 
 def resolve_best_repo_path(log_path_hint: str, target_repo_dir: str, ignore_dirs: set[str]) -> str:
     """根據 Log 提供的路徑，利用最長共同目錄比對 (Longest Common Suffix) 找出真實的 Repo 路徑"""
@@ -240,12 +266,9 @@ def read_symbol_code(file_path_hint: str, target_symbol: str) -> str:
         return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
 
     # 2. 讀取 AST 字典
-    meta_path = os.path.join(_tool_env["db_dir"], "symbol_bounds.json")
-    if not os.path.exists(meta_path):
-        return "系統錯誤：AST 字典不存在。"
-        
-    with open(meta_path, "r", encoding="utf-8") as f:
-        ast_data = json.load(f)
+    ast_data = _tool_env["symbol_bounds"]
+    if not ast_data:
+        return "系統錯誤： symbol_bounds 字典未成功載入。"
         
     # 3. 找出對應檔案的 AST 實體 (注意路徑格式的比對)
     target_entities = None
@@ -314,13 +337,10 @@ def read_function_by_line(file_path_hint: str, line_number: int) -> str:
         return f"讀取失敗: 找不到符合 '{file_path_hint}' 的檔案。請考慮改用語意搜尋 (semantic_code_search)。"
 
     # 2. 讀取 AST 邊界字典
-    meta_path = os.path.join(_tool_env["db_dir"], "symbol_bounds.json")
-    if not os.path.exists(meta_path):
-        return "系統錯誤：AST 字典 (symbol_bounds.json) 不存在。請確認是否已成功建構索引。"
-        
-    with open(meta_path, "r", encoding="utf-8") as f:
-        ast_data = json.load(f)
-        
+    ast_data = _tool_env["symbol_bounds"]
+    if not ast_data:
+        return "系統錯誤： symbol_bounds 字典未成功載入。"
+
     # 3. 找出對應檔案的 AST 實體 (注意路徑格式的比對)
     target_entities = None
     target_file_key = None
@@ -398,16 +418,9 @@ def analyze_class_architecture(class_name: str) -> str:
     - class_name 必須輸入目標 Class 的名稱。
     """
     # 確保這裡的路徑與你存檔的路徑一致
-    tree_path = os.path.join(_tool_env["db_dir"], "class_dependency_tree.json") 
-    
-    if not os.path.exists(tree_path):
-        return "錯誤：相依樹檔案不存在，請確認是否已成功建構索引。"
-        
-    try:
-        with open(tree_path, "r", encoding="utf-8") as f:
-            graph = json.load(f)
-    except Exception as e:
-        return f"讀取相依樹檔案失敗: {e}"
+    graph = _tool_env["class_tree"]
+    if not graph:
+        return "系統錯誤： class_dependency_tree 字典未成功載入。"
         
     if class_name not in graph:
         # 提供模糊搜尋建議，幫助 LLM 修正拼字錯誤
@@ -489,16 +502,10 @@ def find_virtual_overrides(function_name: str, base_class: str) -> str:
     - base_class: 定義該虛擬函數的父類別名稱。
     """
     print(f"find_virtual_overrides, function_name = {function_name}, base_class = {base_class}")
-    
-    tree_path = os.path.join(_tool_env["db_dir"], "class_dependency_tree.json")
-    if not os.path.exists(tree_path):
-        return "錯誤：相依樹檔案不存在。"
-        
-    try:
-        with open(tree_path, "r", encoding="utf-8") as f:
-            graph = json.load(f)
-    except Exception as e:
-        return f"讀取相依樹檔案失敗: {e}"
+
+    graph = _tool_env["class_tree"]
+    if not graph:
+        return "系統錯誤： class_dependency_tree 字典未成功載入。"
         
     if base_class not in graph:
         return f"找不到父類別 '{base_class}'，請確認名稱是否正確。"
@@ -555,24 +562,13 @@ def find_symbol_references(symbol_name: str) -> str:
     print(f"find_symbol_references, symbol_name = {symbol_name}")
     
     # 讀取剛剛在 Indexer 階段建立的字典
-    ref_path = os.path.join(_tool_env["db_dir"], "symbol_references.json")
-    bounds_path = os.path.join(_tool_env["db_dir"], "symbol_bounds.json")
-    
-    if not os.path.exists(ref_path):
-        return "系統錯誤：Symbol Reference 字典不存在。請確認是否已成功建構索引。"
-        
-    try:
-        with open(ref_path, "r", encoding="utf-8") as f:
-            ref_data = json.load(f)
-            
-        # 同時讀取 AST 邊界字典，用於獲取 Function / Class 的上下文範圍
-        bounds_data = {}
-        if os.path.exists(bounds_path):
-            with open(bounds_path, "r", encoding="utf-8") as f:
-                bounds_data = json.load(f)
-                
-    except Exception as e:
-        return f"讀取字典檔案失敗: {e}"
+    ref_data = _tool_env["symbol_refs"]
+    if not ref_data:
+        return "系統錯誤： symbol_references 字典未成功載入。"
+
+    bounds_data = _tool_env["symbol_bounds"]
+    if not bounds_data:
+        return "系統錯誤： symbol_bounds 字典未成功載入。"
         
     # 檢查符號是否存在
     if symbol_name not in ref_data:
@@ -679,6 +675,7 @@ def find_symbol_references(symbol_name: str) -> str:
 
 __all__ = [
     "init_tools",
+    "get_ast_dictionaries",
     "semantic_code_search",
     "resolve_best_repo_path",
     "read_code_snippet",

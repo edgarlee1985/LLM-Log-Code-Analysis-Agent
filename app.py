@@ -712,10 +712,8 @@ def enrich_trace_with_code(clues: LogClues, tools) -> str:
     bounds_path = os.path.join(db_dir, "symbol_bounds.json")
     
     # 只需要讀取單一的 bounds 字典
-    ast_data = {}
-    if os.path.exists(bounds_path):
-        with open(bounds_path, "r", encoding="utf-8") as f:
-            ast_data = json.load(f)
+    ast_dicts = get_ast_dictionaries()
+    ast_data = ast_dicts["symbol_bounds"]
             
     trace_context = []
     # 只取前三層軌跡
