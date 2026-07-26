@@ -17,6 +17,7 @@ from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_classic.output_parsers import OutputFixingParser
+from langchain_core.exceptions import OutputParserException
 from langchain_ollama import ChatOllama
 from langchain_ollama import OllamaEmbeddings
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
@@ -113,6 +114,7 @@ class GraphState(TypedDict):
     iterations: int
     is_resolved: bool
     final_report: str
+    fix_count: int
 
 #==============================================================================================================
 class TokenTrackerCallback(BaseCallbackHandler):
@@ -152,7 +154,24 @@ class TokenTrackerCallback(BaseCallbackHandler):
                     self.all_prompt_tokens += in_tokens
                     self.all_completion_tokens += out_tokens
                     self.all_total_tokens += total
+#==============================================================================================================
+class LoggingOutputFixingParser(OutputFixingParser):
+    # 增加一個類別屬性來記錄次數
+    fix_count: int = 0
 
+    def parse(self, text: str):
+        try:
+            # 1. 先嘗試使用原始的 base_parser 解析
+            return self.parser.parse(text)
+        except (Exception, OutputParserException) as e:
+            # 2. 如果捕捉到錯誤 (包含 Pydantic 的 ValueError)，代表觸發了修復機制
+            self.fix_count += 1
+            print(f"\n⚠️ [Parser 修復觸發] 第 {self.fix_count} 次啟動 LLM 格式修復！")
+            print(f"❌ 攔截到的原始錯誤: {e}")
+            print(f"🔄 正在將錯誤訊息與錯誤 JSON 送回給 LLM 重新生成...\n")
+            
+            # 3. 呼叫父類別原本的修復邏輯 (這會真正呼叫 LLM 進行修正)
+            return super().parse(text)
 #==============================================================================================================
 rag_agent_system_prompt = """你是一個專為「AI 檢索探員 (RAG Agent)」提供精確搜索彈藥的【資深技術日誌萃取引擎】。
 你收到的原始資料可能混雜了「QA/RD 的口語對話」、「測試步驟」以及「系統崩潰日誌 (Log/Stack Trace)」。
@@ -428,7 +447,7 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
         # 建立 JsonOutputParser，並綁定你的 Pydantic 模型
         base_parser = JsonOutputParser(pydantic_object=EngineerEvaluation)
 
-        fixing_parser = OutputFixingParser.from_llm(parser=base_parser, llm=engineer_llm)
+        fixing_parser = LoggingOutputFixingParser.from_llm(parser=base_parser, llm=engineer_llm)
 
         # 在 Prompt 結尾動態注入 Parser 產生的「嚴格格式說明 (format_instructions)」
         prompt = ChatPromptTemplate.from_messages([
@@ -484,7 +503,8 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
             # 將 Pydantic 物件轉成 dict 存入 state (相容性較好)
             "current_request": evaluation.next_search_request.model_dump() if evaluation.next_search_request else None,
             "is_resolved": evaluation.is_resolved,
-            "final_report": evaluation.final_report or ""
+            "final_report": evaluation.final_report or "",
+            "fix_count": state.get("fix_count", 0) + fixing_parser.fix_count
         }
 
     def detective_node(state: GraphState):
@@ -827,7 +847,8 @@ if __name__ == "__main__":
             
             "iterations": 1,
             "is_resolved": False,
-            "final_report": ""
+            "final_report": "",
+            "fix_count": 0
         }
         
         # 執行 Graph 迴圈
@@ -845,6 +866,7 @@ if __name__ == "__main__":
         print(f"輸入量 : {token_tracker.current_prompt_tokens}")
         print(f"生成量 : {token_tracker.current_completion_tokens}")
         print(f"單次總用量 : {token_tracker.current_total_tokens}")
+        print(f"🔧 LLM 觸發 JSON 修復次數 : {final_state.get('fix_count', 0)}")
         print("=" * 40)
 
         #print("--- 階段二 & 三：啟動 Agentic 迭代排查 ---")
