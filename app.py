@@ -2,6 +2,7 @@ import os
 import configparser
 import time
 import json
+import re
 from typing import List, Dict, Optional
 from typing import Annotated, TypedDict
 from pydantic import BaseModel, Field, model_validator
@@ -777,6 +778,60 @@ def enrich_trace_with_code(clues: LogClues, tools) -> str:
     
     return json.dumps(enriched_info, ensure_ascii=False, indent=2)
 
+
+
+def compress_repetitive_logs(raw_log: str, max_pattern_lines: int = 5, max_repeats: int = 2) -> str:
+    """
+    高效能版本的迴圈 Log 壓縮工具 (時間複雜度 O(N))
+    
+    :param raw_log: 原始 Log 字串
+    :param max_pattern_lines: 要偵測的迴圈最大行數 (例如 A->B->C 就是 3 行)
+    :param max_repeats: 允許重複的最大次數
+    """
+    if not raw_log:
+        return raw_log
+
+    lines = raw_log.split('\n')
+    n = len(lines)
+    result = []
+    
+    i = 0
+    while i < n:
+        match_found = False
+        
+        # 嘗試尋找重複的 pattern，從大範圍 (max_pattern_lines) 往小範圍 (1) 找
+        for p_len in range(max_pattern_lines, 0, -1):
+            if i + p_len <= n:
+                # 擷取候選的 Pattern 區塊
+                pattern = lines[i : i + p_len]
+                
+                # 計算這個 Pattern 連續出現了幾次
+                repeats = 1
+                idx = i + p_len
+                # Python 的陣列切片比對 (lines[...] == pattern) 速度非常快
+                while idx + p_len <= n and lines[idx : idx + p_len] == pattern:
+                    repeats += 1
+                    idx += p_len
+                    
+                # 如果重複次數超過允許上限
+                if repeats > max_repeats:
+                    # 保留第一組 Pattern
+                    result.extend(pattern)
+                    # 加上省略提示
+                    result.append(f"[... 系統偵測到長度 {p_len} 行的無限迴圈，共重複 {repeats} 次，已自動省略 ...]")
+                    
+                    # 游標直接跳過所有重複的區域，這是高效能的關鍵！
+                    i = idx 
+                    match_found = True
+                    break # 找到符合的迴圈就跳出 for，繼續往後掃描
+                    
+        # 如果這幾行沒有構成無限迴圈，就正常加入結果，游標前進 1 行
+        if not match_found:
+            result.append(lines[i])
+            i += 1
+            
+    return '\n'.join(result)
+
 # ==========================================
 # 主程式：完整工作流整合
 # ==========================================
@@ -839,13 +894,20 @@ if __name__ == "__main__":
         clues = parse_report(llm_json, report)
         enriched_clues_json = enrich_trace_with_code(clues, tools)
         print(f"萃取線索: {enriched_clues_json}\n")
+
+        raw_logs_str = "\n".join(
+            [f"=== {k} ===\n{v}" for k, v in report.logs.items()]
+        ).replace("\\", "/")
+
+        # 用正則表達式壓縮多行循環 Log
+        compressed_logs = compress_repetitive_logs(raw_logs_str, max_pattern_lines=10, max_repeats=2)
         
         # 初始化 State
         initial_state = {
             "bug_id": report.bug_id,
             "steps": report.steps_to_reproduce,
             # 將這裡的反斜線替換掉，保護 Agentic 流程的 JSON 解析
-            "logs": "\n".join([f"=== {k} ===\n{v}" for k, v in report.logs.items()]).replace("\\", "/"),
+            "logs": compressed_logs,
             "log_clues": enriched_clues_json,
             
             # 變數更名
