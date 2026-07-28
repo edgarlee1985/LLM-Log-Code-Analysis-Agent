@@ -62,6 +62,13 @@ class LogClues(BaseModel):
         description="從 Log 推導出的前三層執行軌跡 (Stack Trace)，由發生問題的最深層往外推。"
     )
 
+class FinalReport(BaseModel):
+    """當尋找到 Root Cause 時，輸出的最終結構化報告"""
+    bug_title: str = Field(description="一句話總結 Bug 的核心現象。")
+    root_cause_analysis: str = Field(description="詳細的根本原因分析。若涉及 C++ 語言特性陷阱（如迭代器失效、預設參數靜態綁定等），必須明確點出。")
+    error_location: str = Field(description="具體的檔案名稱與引發錯誤的函數名稱。")
+    fix_proposal: str = Field(description="具體的修復方案，並包含修復後的 C++ 程式碼範例。")
+
 class DetectiveCommand(BaseModel):
     """工程師開給探員的情報需求單"""
     hypothesis: str = Field(
@@ -90,12 +97,19 @@ class EngineerEvaluation(BaseModel):
     step_by_step_reasoning: str = Field(default="", description="請詳細推演你的邏輯鏈條：上一步看到了什麼？符合預期嗎？接下來要驗證什麼？")
     is_resolved: bool = Field(default=False, description="是否已經找到 Root Cause 並能提出修復方案？")
     next_search_request: Optional[DetectiveCommand] = Field(default=None, description="【極度重要】當 is_resolved 為 false 時，此欄位【絕對必填】！請務必填寫下一步的檢索指令。只有當 is_resolved 為 true 時才允許留空 (null)。")
-    final_report: Optional[str] = Field(default=None, description="如果 is_resolved 為 True，輸出完整修復報告；否則留空")
+    final_report: Optional[FinalReport] = Field(default=None, description="當 is_resolved 為 True 時，必須輸出此完整修復報告。")
+
     @model_validator(mode='after')
-    def check_request_if_not_resolved(self) -> 'EngineerEvaluation':
-        # 如果尚未解決，但 LLM 卻沒有給下一步指令，強制報錯
-        if not self.is_resolved and not self.next_search_request:
-            raise ValueError("當 is_resolved 為 false 時，next_search_request 絕對不能為空！")
+    def validate_routing_logic(self) -> 'EngineerEvaluation':
+        """雙向邏輯防呆"""
+        if self.is_resolved:
+            if not self.final_report:
+                # 攔截 LLM 說解決了，卻不給報告的偷懶行為
+                raise ValueError("邏輯衝突：當 is_resolved 為 true 時，final_report 絕對不能為空！請提供完整的結構化修復報告。")
+        else:
+            if not self.next_search_request:
+                # 攔截 LLM 還沒解決，卻不指派任務的發呆行為
+                raise ValueError("邏輯衝突：當 is_resolved 為 false 時，next_search_request 絕對不能為空！請指派探員下一步任務。")
         return self
 
 
@@ -224,7 +238,7 @@ engineer_system_prompt = """你是一位頂尖的資深軟體工程師，負責�
 【🚨 核心守則】
 1. 絕不憑空捏造未被檢索出來的程式碼邏輯。
 2. 只針對導致「當前 Bug Log」的程式碼進行排查。
-3. 終止條件：只要你已經明確知道 Bug 發生在哪個檔案、哪一行，且能寫出具體的修復程式碼 (Fix)，就【必須】將 is_resolved 設為 true 並輸出 final_report，絕對禁止再指派毫無意義的確認任務給探員。
+3. 終止條件：若線索不足，將 `is_resolved` 設為 false 並填寫 `next_search_request`；若你已經明確知道 Bug 發生在哪個檔案、哪一行，且能寫出具體的修復程式碼 (Fix)，【必須】將 `is_resolved` 設為 true 並詳盡填寫 `final_report` 結構，絕對禁止再指派毫無意義的確認任務給探員。
 
 【📝 輸出要求與 JSON 防呆守則 (極度重要)】
 1. 如果你需要於 reasoning 或 hypothesis 欄位中「引用任何程式碼或 Log 內容」，請務必將原程式碼的「雙引號 (\")」替換為「單引號 (')」！
@@ -500,12 +514,21 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
         if not evaluation.is_resolved:
             print(f"下一步假設: {evaluation.next_search_request.hypothesis if evaluation.next_search_request else '無'}")
             print(f"下一步行動: {evaluation.next_search_request.action_type if evaluation.next_search_request else '無'}")
-            
+
+        # 將結構化的 FinalReport 轉換為漂亮的 Markdown 字串
+        formatted_report = ""
+        if evaluation.is_resolved and evaluation.final_report:
+            report_obj = evaluation.final_report
+            formatted_report = (
+                f"### 🚨 Bug 摘要\n{report_obj.bug_title}\n\n"
+                f"### 🔍 根本原因 (Root Cause)\n{report_obj.root_cause_analysis}\n\n"
+                f"### 📍 發生落點\n{report_obj.error_location}\n\n"
+                f"### 🛠️ 修復方案 (Fix)\n{report_obj.fix_proposal}"
+            )
         return {
-            # 將 Pydantic 物件轉成 dict 存入 state (相容性較好)
             "current_request": evaluation.next_search_request.model_dump() if evaluation.next_search_request else None,
             "is_resolved": evaluation.is_resolved,
-            "final_report": evaluation.final_report or "",
+            "final_report": formatted_report, 
             "fix_count": state.get("fix_count", 0) + fixing_parser.fix_count
         }
 
