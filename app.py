@@ -745,7 +745,7 @@ def run_debugging_agent(bug_report: SingleBugReport, log_clues: LogClues):
     
     return result["output"]
 
-def enrich_trace_with_code(clues: LogClues, tools) -> str:
+def enrich_trace_with_code(clues: LogClues) -> str:
     """根據解析出的軌跡，直接從 AOT 計算好的 AST 字典中讀取：檔案、Function、行號以及使用的成員函數、成員變數"""
     if not clues.execution_trace:
         enriched_info = clues.model_dump()
@@ -870,39 +870,49 @@ if __name__ == "__main__":
     # 建立統計實例
     token_tracker = TokenTrackerCallback()
 
-    llm_json = ChatOllama(model=config["Default"]["ModelName"],
-                        temperature=0.0,
-                        seed=50, repeat_penalty=1.2,
-                        num_ctx=16384,
-                        num_predict=4096,
-                        format="json", 
-                        callbacks=[token_tracker]
-                        )
+    parse_llm = ChatOllama(model=config["Default"]["ModelName"],
+                           temperature=0.0,
+                           seed=50, repeat_penalty=1.2,
+                           num_ctx=24576,
+                           num_predict=4096,
+                           format="json", 
+                           callbacks=[token_tracker]
+                           )
+    
+    engineer_llm = ChatOllama(model=config["Default"]["ModelName"],
+                              temperature=0.0,
+                              seed=50, repeat_penalty=1.2,
+                              num_ctx=24576,
+                              num_predict=4096,
+                              format="json", 
+                              callbacks=[token_tracker]
+                              )
 
-    llm_text = ChatOllama(model=config["Default"]["ModelName"],
-                        temperature=0.0,
-                        seed=50, repeat_penalty=1.2,
-                        num_ctx=16384,
-                        num_predict=4096,
-                        # 不加 format="json"
-                        callbacks=[token_tracker]
-                        )
+    detective_llm = ChatOllama(model=config["Default"]["ModelName"],
+                               temperature=0.0,
+                               seed=50, repeat_penalty=1.2,
+                               num_ctx=24576,
+                               num_predict=4096,
+                               # 不加 format="json"
+                               callbacks=[token_tracker]
+                               )
     
     embeddings = OllamaEmbeddings(model = config["Default"]["EmbeddingModelName"])
     ensemble_retriever = build_or_load_retriever(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, embeddings=embeddings)
     init_tools(repo_dir=repo_dir, db_dir=db_dir, ignore_dirs=IGNORE_DIRS, ensemble_retriever=ensemble_retriever)
-    tools = [semantic_code_search,
-            read_code_snippet,
-            get_git_blame,
-            exact_keyword_search,
-            read_symbol_code,
-            read_function_by_line,
-            analyze_class_architecture,
-            find_virtual_overrides,
-            find_symbol_references]
+    detective_tools = [semantic_code_search,
+                       read_code_snippet,
+                       get_git_blame,
+                       exact_keyword_search,
+                       read_symbol_code,
+                       read_function_by_line,
+                       analyze_class_architecture,
+                       find_virtual_overrides,
+                       find_symbol_references
+                       ]
 
     # 建立 Graph
-    debugger_app = build_debugging_graph(llm_json, llm_text, tools)
+    debugger_app = build_debugging_graph(engineer_llm, detective_llm, detective_tools)
 
     # ===== 初始化統計變數 =====
     total_bugs = len(bug_reports)
@@ -915,8 +925,8 @@ if __name__ == "__main__":
         token_tracker.reset_current()
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
-        clues = parse_report(llm_json, report)
-        enriched_clues_json = enrich_trace_with_code(clues, tools)
+        clues = parse_report(parse_llm, report)
+        enriched_clues_json = enrich_trace_with_code(clues)
         print(f"萃取線索: {enriched_clues_json}\n")
 
         raw_logs_str = "\n".join(
