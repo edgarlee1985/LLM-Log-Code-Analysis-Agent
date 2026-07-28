@@ -291,7 +291,7 @@ def read_bug_report(report_dir: str) -> List[SingleBugReport]:
             txt_file_path = bug_dir / f"{bug_id}.txt"
             if txt_file_path.exists() and txt_file_path.is_file():
                 # 建議加上 encoding="utf-8" 避免跨平台中文編碼錯誤
-                with open(txt_file_path, "r", encoding="utf-8") as f:
+                with open(txt_file_path, "r", encoding="utf-8", errors="replace") as f:
                     steps_to_reproduce = f.read()
             else:
                 print(f"警告: {bug_id} 目錄下找不到 {bug_id}.txt")
@@ -299,7 +299,7 @@ def read_bug_report(report_dir: str) -> List[SingleBugReport]:
             # 2. 讀取目錄下的所有 application.log_x 檔案
             for file_path in bug_dir.iterdir():
                 if file_path.is_file() and file_path.name.startswith("application.log"):
-                    with open(file_path, "r", encoding="utf-8") as f:
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                         logs[file_path.name] = f.read()
             
             # 將收集到的資料建立為 SingleBugReport 模型並加入列表

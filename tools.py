@@ -25,17 +25,17 @@ def init_tools(repo_dir: str, db_dir: str, ignore_dirs: set[str], ensemble_retri
     # 一次性載入三個字典檔案到記憶體
     bounds_path = os.path.join(db_dir, "symbol_bounds.json")
     if os.path.exists(bounds_path):
-        with open(bounds_path, "r", encoding="utf-8") as f:
+        with open(bounds_path, "r", encoding="utf-8", errors="replace") as f:
             _tool_env["symbol_bounds"] = json.load(f)
 
     tree_path = os.path.join(db_dir, "class_dependency_tree.json")
     if os.path.exists(tree_path):
-        with open(tree_path, "r", encoding="utf-8") as f:
+        with open(tree_path, "r", encoding="utf-8", errors="replace") as f:
             _tool_env["class_tree"] = json.load(f)
 
     refs_path = os.path.join(db_dir, "symbol_references.json")
     if os.path.exists(refs_path):
-        with open(refs_path, "r", encoding="utf-8") as f:
+        with open(refs_path, "r", encoding="utf-8", errors="replace") as f:
             _tool_env["symbol_refs"] = json.load(f)
 
 def get_ast_dictionaries() -> dict:
