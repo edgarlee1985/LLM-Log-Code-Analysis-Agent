@@ -551,7 +551,10 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
         
         # 將 Prompt 轉換為標準的 Message 陣列
         system_msg = SystemMessage(content=detective_system_prompt)
-        human_msg = HumanMessage(content=f"【情報需求單】\n{search_query}\n\n【原始 Bug 步驟】\n{state['steps']}\n\n【原始 Log】\n{state['logs']}")
+        human_msg = HumanMessage(
+            content=f"【情報需求單】\n{search_query}\n\n"
+            f"請嚴格根據上述情報單的指示與工具選擇 SOP 進行檢索，並直接回答工程師的【關注點】。"
+            )
         
         # 呼叫 Sub-Graph，取代 AgentExecutor
         recursion_limit = 20
@@ -928,23 +931,13 @@ if __name__ == "__main__":
         clues = parse_report(parse_llm, report)
         enriched_clues_json = enrich_trace_with_code(clues)
         print(f"萃取線索: {enriched_clues_json}\n")
-
-        raw_logs_str = "\n".join(
-            [f"=== {k} ===\n{v}" for k, v in report.logs.items()]
-        ).replace("\\", "/")
-
-        # 用正則表達式壓縮多行循環 Log
-        compressed_logs = compress_repetitive_logs(raw_logs_str, max_pattern_lines=10, max_repeats=2)
         
         # 初始化 State
         initial_state = {
             "bug_id": report.bug_id,
             "steps": report.steps_to_reproduce,
-            # 將這裡的反斜線替換掉，保護 Agentic 流程的 JSON 解析
-            "logs": compressed_logs,
             "log_clues": enriched_clues_json,
             
-            # 變數更名
             "investigation_history": [],
             "current_request": None, 
             
