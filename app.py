@@ -50,7 +50,8 @@ class SingleBugReport(BaseModel):
 # 定義預期的 Log 結構
 class TraceFrame(BaseModel):
     file_name: str = Field(default="", description="Log 中提到的檔案路徑或名稱")
-    line_number: int = Field(default=-1, description="對應的行號")
+    line_number: int = Field(default=-1, description="對應的行號。若無明確行號請填 -1")
+    function_name: str = Field(default="", description="Log 中提到的函數或方法名稱。若無則留空")
 
 class LogClues(BaseModel):
     error_type: Optional[str] = Field(default=None, description="明確的錯誤類型...")
@@ -169,6 +170,30 @@ class TokenTrackerCallback(BaseCallbackHandler):
                     self.all_prompt_tokens += in_tokens
                     self.all_completion_tokens += out_tokens
                     self.all_total_tokens += total
+
+class TraceRecorder:
+    def __init__(self):
+        self.traces = []
+
+    def get_tool(self):
+        @tool("record_trace_anchor")
+        def record_trace_anchor(file_name: str, line_number: int, function_name: str) -> str:
+            """
+            【功能】當你確認某行 Log 確實是從某個檔案與行號印出來時，必須【立即】呼叫此工具進行存檔。
+            
+            【輸入規範】
+            - file_name: 發生日誌輸出的確切檔案路徑。
+            - line_number: 具體的行號。
+            - function_name: 該行號所屬的函數名稱 (若不知可留空)。
+            """
+            self.traces.append({
+                "file_name": file_name,
+                "line_number": line_number,
+                "function_name": function_name
+            })
+            return f"✅ 已成功存檔軌跡：{file_name}:{line_number}。目前已收集 {len(self.traces)} 筆。"
+        
+        return record_trace_anchor
 #==============================================================================================================
 class LoggingOutputFixingParser(OutputFixingParser):
     # 增加一個類別屬性來記錄次數
@@ -213,7 +238,8 @@ rag_agent_system_prompt = """你是一個專為「AI 檢索探員 (RAG Agent)」
    
 4. 執行軌跡 (execution_trace):
    - 若 Log 包含 Stack Trace 或多筆時序紀錄，請由下而上 (或依發生順序) 萃取最接近錯誤點的前 3 層檔案名稱與行號。
-   - 若 Log 缺乏具體行號，請將猜測的關鍵字或函數名稱填入 file_name，並將 line_number 設為 -1。
+   - 🚨 【極度重要】：絕不可將系統啟動、初始化 (Initialization)、或常規 UI 點擊的 Log (例如建構子、SetupUI) 視為錯誤軌跡！
+   - 如果 Log 尾端沒有明確與崩潰、錯誤或異常行為直接相關的檔案行號，請保持 execution_trace 為空陣列 []，絕對不要為了填補資料而往上抓取無關的行號。
 
 請保持冷靜、客觀，忽略無關痛癢的對話，輸出最精煉的技術線索。"""
 
@@ -333,54 +359,134 @@ def read_bug_report(report_dir: str) -> List[SingleBugReport]:
 # ==========================================
 # 步驟一：從 Log 中萃取「精準線索」（Log Parsing）
 # ==========================================
-def parse_report(llm, bug_report: SingleBugReport) -> LogClues:
-    """使用 LLM 將雜亂的 Log 轉換為結構化線索"""
-    
-    # 由於 bug_report.logs 是 Dict[str, str]，我們將其組合成單一字串
-    # 加上檔名標籤 (例如 === application.log_1 ===)，讓 LLM 能區分不同的 log 來源
-    combined_logs = "\n\n".join(
-        f"=== {filename} ===\n{content}" 
-        for filename, content in bug_report.logs.items()
-    )
+def run_agentic_log_parser(agent_llm, parse_tools, combined_logs: str) -> str:
+    """
+    啟動探員 (Agent) 進行 Log 的實地查訪，專注於尋找錯誤錨點。
+    採用「函數上下文感知 (Function Context-Aware)」的 Bottom-Up 追溯。
+    回傳一個包含 'traces' (已存檔軌跡) 與 'text' (文字報告) 的字典
+    """
 
-    # 將 Windows 路徑的反斜線替換為正斜線，避免 JSON 跳脫字元崩潰
-    combined_logs = combined_logs.replace("\\", "/")
-    
-    # 如果 logs 是空的，給予預設提示避免 LLM 混淆
-    if not combined_logs.strip():
-        combined_logs = "此 Bug 沒有任何對應的 Log 紀錄。"
+    # 初始化存檔器
+    recorder = TraceRecorder()
+    # 將存檔工具加入 Agent 的工具箱
+    extended_tools = parse_tools + [recorder.get_tool()]
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", rag_agent_system_prompt),
-        ("human", "【原始 Bug 報告與 Log 紀錄】\n{raw_log}")
+    investigator_prompt = ChatPromptTemplate.from_messages([
+        ("system", """你是一個專職尋找「程式碼錨點 (Anchor)」的日誌調查探員。
+由於後續的工程師模型需要極度精確的起點才能進行除錯，你的唯一任務是從 Log 中找出最後執行的真實程式碼位置。
+
+【🚨 嚴格底層向上追溯與即時存檔守則】：
+1. 起點尋找：從 Log 的「最後一行」開始閱讀，使用 `locate_log_statement` 工具尋找確切檔案與行號。
+   - ⚠️ 關鍵搜尋技巧：傳入的字串必須是「程式碼中寫死的靜態字串 (Hardcoded strings)」。
+   - ⚠️ 絕對要過濾掉 Log 中的動態數值 (如 ID、訂單號碼 101、餘額數字)、記憶體位址或時間戳記！
+   - 若一次搜尋失敗，請縮短字串，僅保留最核心的英文字詞再次搜尋，或改用 `exact_keyword_search`。
+2. 【極度重要：即時存檔】：每當你成功找到一個確切的錨點（檔案、行號、函數），【必須立即】呼叫 `record_trace_anchor` 工具存檔！絕對不要等到最後才一次輸出。
+3. 向上追溯與跳過同源 Log：
+   - 如果上一條 Log 也是由「同一個函數」印出來的，請忽略它並繼續往上找。
+4. 🛑 終止條件：
+   - 在呼叫 `record_trace_anchor` 成功收集到【最多 3 個不同的函數錨點】後，請立即停止搜尋並結束任務。"""),
+        ("human", "【原始 Bug 報告與 Log 紀錄】\n{raw_log}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
     
-    # 結合 LCEL 與 Structured Output 確保回傳 Pydantic 格式
-    parser_chain = prompt | llm.with_structured_output(LogClues)
+    agent = create_tool_calling_agent(agent_llm, extended_tools, investigator_prompt)
+    
+    agent_runner = AgentExecutor(
+        agent=agent,
+        tools=extended_tools,
+        verbose=True,
+        max_iterations=15,
+        handle_parsing_errors=True # 容錯機制
+    )
+
+    verified_text = "任務順利完成。"
     try:
-        logclues = parser_chain.invoke({"raw_log": combined_logs})
+        agent_result = agent_runner.invoke({"raw_log": combined_logs})
+        verified_text = agent_result["output"]
+    except Exception as e:
+        print(f"⚠️ Agent 執行中斷 (可能是超時或格式錯誤): {e}")
+        verified_text = f"Agent 執行中斷，但已保留部分軌跡。錯誤資訊: {e}"
+
+    # 無論是成功跑完還是中途崩潰，都把 recorder.traces 救回來回傳！
+    return {
+        "traces": recorder.traces,
+        "text": verified_text
+    }
+
+def convert_agent_result_to_json(json_llm, combined_logs: str, verified_context: str) -> LogClues:
+    """
+    將 Agent 的調查報告轉化為結構化的 LogClues JSON 格式。
+    """
+    # 這裡的 rag_agent_system_prompt 是你原本全域定義的變數
+    struct_prompt = ChatPromptTemplate.from_messages([
+        ("system", rag_agent_system_prompt),
+        ("human", "【原始 Log】\n{raw_log}\n\n【經過 Agent 驗證後的真實線索報告】\n{verified_context}\n\n請以「Agent 驗證報告」為絕對優先依據，將其轉化為 LogClues JSON 格式。")
+    ])
+    
+    parser_chain = struct_prompt | json_llm.with_structured_output(LogClues)
+    
+    try:
+        logclues = parser_chain.invoke({
+            "raw_log": combined_logs,
+            "verified_context": verified_context
+        })
     except (Exception, ValidationError) as e:
         print(f"解析 JSON 或生成失敗: {e}")
-        # 將原始 Log 進行截斷 (避免 Context Window 爆掉，取最後 1500 字元，因為錯誤通常在最下面)
         log_snippet = combined_logs[-1500:] if len(combined_logs) > 1500 else combined_logs
         
-        # 將原始 Log 直接嵌入 semantic_issue 傳遞給 Engineer
         fallback_semantic = (
-            "【系統警告】：LLM 結構化解析 Log 失敗。\n"
-            "【探員行動建議】：請直接閱讀以下擷取的原始 Log，找出任何可疑的 '關鍵字'、'函數' 或 '檔案名稱'，"
-            "並利用 exact_keyword_search 或 semantic_code_search 展開調查。\n\n"
+            "【系統警告】：LLM 結構化解析失敗。\n"
+            f"【Agent 驗證紀錄】：{verified_context}\n\n"
             f"--- 原始 Log 節錄 ---\n{log_snippet}"
         )
+        # Fallback 機制：保證即使解析崩潰，也能吐出一個帶有錯誤訊息的 LogClues 物件
         logclues = LogClues(
             error_type="LogParseError",
             file_name=None,
             line_number=-1,
-            semantic_issue= fallback_semantic,
+            semantic_issue=fallback_semantic,
             execution_trace=[] 
         )
-
     
-    # 將組合好的 logs 字串傳遞給 prompt 中的 {raw_log} 變數
+    return logclues
+
+# ==========================================
+def parse_report(agent_llm, json_llm, parse_tools, bug_report: SingleBugReport) -> LogClues:
+    """全面採用 Agentic Log Parser 尋找錨點，再由 JSON LLM 結構化輸出"""
+    
+    # 組合 Log
+    raw_logs = "\n\n".join(
+        f"=== {filename} ===\n{content}" 
+        for filename, content in bug_report.logs.items()
+    ).replace("\\", "/")
+    
+    # 壓縮 Logs (保留你原本處理無限迴圈的邏輯)
+    combined_logs = compress_repetitive_logs(raw_logs, max_pattern_lines=10, max_repeats=2)
+    
+    if not combined_logs.strip():
+        combined_logs = "此 Bug 沒有任何對應的 Log 紀錄。"
+
+    # 【Slow Path 變為 Main Path】: 啟動精準的 Agent 實地查訪尋找錨點
+    print("[Log Parsing] 啟動 Agentic 錨點定位 (Bottom-Up 追溯)...")
+    agent_result = run_agentic_log_parser(agent_llm, parse_tools, combined_logs)
+    verified_context = agent_result["text"]
+    saved_traces = agent_result["traces"]
+    
+    # 將 Agent 帶回的「絕對正確的錨點」轉換為 JSON 格式給 Engineer
+    print("[Log Parsing] 將錨點報告結構化...")
+    logclues = convert_agent_result_to_json(json_llm, combined_logs, verified_context)
+    
+    # 🎯 【防護網】：將 Agent 即時存檔的軌跡「強制覆寫」進去！
+    # 這樣就算 JSON LLM 漏掉、或是 Agent 中途崩潰，我們依然有資料
+    if saved_traces:
+        logclues.execution_trace = [
+            TraceFrame(
+                file_name=t["file_name"], 
+                line_number=t["line_number"], 
+                function_name=t["function_name"]
+            ) for t in saved_traces
+        ]
+        
     return logclues
 
 # ==========================================
@@ -914,6 +1020,11 @@ if __name__ == "__main__":
                        find_symbol_references
                        ]
 
+    parse_tools = [locate_log_statement,
+                   exact_keyword_search,
+                   semantic_code_search,
+                   ]
+
     # 建立 Graph
     debugger_app = build_debugging_graph(engineer_llm, detective_llm, detective_tools)
 
@@ -928,7 +1039,7 @@ if __name__ == "__main__":
         token_tracker.reset_current()
         print(f"開始分析 bug_id: {report.bug_id}")
         print("--- 階段一：啟動 Log 解析 ---")
-        clues = parse_report(parse_llm, report)
+        clues = parse_report(detective_llm, parse_llm, parse_tools, report)
         enriched_clues_json = enrich_trace_with_code(clues)
         print(f"萃取線索: {enriched_clues_json}\n")
         

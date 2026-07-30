@@ -706,6 +706,43 @@ def find_symbol_references(symbol_name: str) -> str:
         
     return "\n".join(report)
 
+@tool
+def locate_log_statement(log_message_snippet: str) -> str:
+    """
+    【功能】尋找某段 Log 訊息在程式碼中被印出來的精確位置 (檔案與行號)。
+    
+    【使用時機】
+    - 當 Log 提供了一段明確的文字訊息 (例如: "Initializing CUDA Cores")，你需要知道這段訊息是從哪個檔案、哪一行印出來的時候。
+    
+    【輸入規範】
+    - log_message_snippet 必須是 Log 中的「純文字片段」，請去掉時間戳記、Thread ID，保留核心英文字串。
+    """
+    print(f"locate_log_statement, snippet = {log_message_snippet}")
+    
+    # 針對 C++/Qt 常見的 log 輸出方式，去除引號等干擾
+    search_term = log_message_snippet.replace('"', '').replace("'", "")
+    
+    try:
+        # 使用 git grep -i (忽略大小寫) -n (顯示行號)
+        cmd = ["git", "grep", "-i", "-n", search_term]
+        result = subprocess.check_output(
+            cmd, 
+            cwd=_tool_env["repo_dir"], 
+            text=True, 
+            encoding='utf-8',
+            errors='replace',
+            stderr=subprocess.STDOUT
+        )
+        
+        lines = result.strip().split('\n')
+        if len(lines) > 10:
+            return f"找到過多結果 ({len(lines)} 筆)，請提供更長、更精確的 Log 字串片段。\n範例前三筆:\n" + "\n".join(lines[:3])
+            
+        return "🎯 找到 Log 輸出的原始碼位置:\n" + result
+        
+    except subprocess.CalledProcessError:
+        return f"找不到包含此 Log 片段 '{search_term}' 的程式碼，可能是動態生成的字串或來自外部函式庫。"
+
 
 __all__ = [
     "init_tools",
@@ -719,4 +756,5 @@ __all__ = [
     "read_function_by_line",
     "analyze_class_architecture",
     "find_virtual_overrides",
-    "find_symbol_references"]
+    "find_symbol_references",
+    "locate_log_statement"]
