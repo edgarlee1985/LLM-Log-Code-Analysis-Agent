@@ -603,15 +603,34 @@ def build_debugging_graph(engineer_llm, detective_llm, tools):
                 print(f"[{msg.type.upper()}]:\n{msg.content}\n")
             print("===============================================\n")
 
-            # 發生極端例外時的 Fallback：強制指派探員繼續隨機調查，避免流程中斷
-            fallback_request = DetectiveCommand(
-                hypothesis="前一次 LLM 生成 JSON 崩潰，嘗試重新理解 Log",
-                action_type="SEMANTIC_SEARCH",
-                target_value="尋找導致崩潰的關鍵字",
-                focus_point="請重新檢視檔案並提供精簡回報"
-            )
+            # --- 動態 Fallback 邏輯 ---
+            # 取得上一次探員收到的指令，延續調查目標
+            prev_req = state.get("current_request")
+            
+            if prev_req:
+                prev_target = prev_req.get("target_value", "未知目標")
+                # 確保 action_type 是合法的 (退回使用 SEARCH_CONCEPT 或保留原本合法的 action)
+                prev_action = prev_req.get("action_type", "SEARCH_CONCEPT")
+                if prev_action not in ["TRACE_STATE", "INSPECT_LOGIC", "SEARCH_CONCEPT", "ANALYZE_STRUCTURE"]:
+                    prev_action = "SEARCH_CONCEPT"
+                    
+                fallback_request = DetectiveCommand(
+                    hypothesis=f"前一次分析 '{prev_target}' 時輸出過長或格式錯誤導致崩潰。必須暫時退回觀察狀態。",
+                    action_type=prev_action, 
+                    target_value=prev_target, # 繼承上一次的目標，不讓探員失憶
+                    focus_point="工程師節點在解析你的上一份報告時記憶體/格式崩潰了。請重新針對此目標，給出一份『極度精簡、條列式』的重點摘要，不要貼出大量程式碼。"
+                )
+            else:
+                # 只有在第一次迭代就崩潰時，才使用基礎 Fallback
+                fallback_request = DetectiveCommand(
+                    hypothesis="初始狀態解析失敗，需要從 Log 重新確立起點。",
+                    action_type="SEARCH_CONCEPT",
+                    target_value="Exception or Null",
+                    focus_point="請根據初始 Log，列出最可疑的檔案與行號即可，保持精簡。"
+                )
+
             evaluation = EngineerEvaluation(
-                step_by_step_reasoning="LLM JSON 解析失敗，啟動備援檢索方案。",
+                step_by_step_reasoning=f"LLM JSON 解析失敗 ({e})，啟動上下文感知備援檢索方案，要求探員精簡回報。",
                 is_resolved=False,
                 next_search_request=fallback_request,
                 final_report=None
